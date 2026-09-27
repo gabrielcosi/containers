@@ -54,12 +54,6 @@
       platformAutomerge: true,
     },
     {
-      description: ["The llama-server binary links the llama-swap image's CUDA runtime, so it must not be built with a newer toolkit"],
-      matchFileNames: ["apps/llama-server/Dockerfile"],
-      matchDepNames: ["docker.io/nvidia/cuda"],
-      enabled: false,
-    },
-    {
       description: ["Auto-merge GitHub Actions minor, patch and digest updates"],
       matchManagers: ["github-actions"],
       matchUpdateTypes: ["minor", "patch", "digest"],

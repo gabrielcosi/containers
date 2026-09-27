@@ -1,0 +1,26 @@
+diff --git a/src/models/muse-glimmer.cpp b/src/models/muse-glimmer.cpp
+index 0e5f75ebe..7e695f40e 100644
+--- a/src/models/muse-glimmer.cpp
++++ b/src/models/muse-glimmer.cpp
+@@ -99,7 +99,7 @@ llama_model_muse_glimmer::graph::graph(const llama_model & model, const llm_grap
+                     n_embd_head, n_head, n_head_kv, il);
+ 
+             // gate = wqkv_gate @ attn_inp (from pre-attn hidden state)
+-            ggml_tensor * gate = build_lora_mm(model.layers[il].wqkv_gate, attn_inp);
++            ggml_tensor * gate = build_lora_mm(model.layers[il].wqkv_gate, attn_inp, model.layers[il].wqkv_gate_s);
+             cb(gate, "attn_gate_proj", il);
+ 
+             // QK-norm. attn_q_norm weight was synthesized at conversion to broadcast
+@@ -156,9 +156,9 @@ llama_model_muse_glimmer::graph::graph(const llama_model & model, const llm_grap
+ 
+         // SwiGLU dense FFN
+         cur = build_ffn(cur,
+-                model.layers[il].ffn_up,   NULL, NULL,
+-                model.layers[il].ffn_gate, NULL, NULL,
+-                model.layers[il].ffn_down, NULL, NULL,
++                model.layers[il].ffn_up,   NULL, model.layers[il].ffn_up_s,
++                model.layers[il].ffn_gate, NULL, model.layers[il].ffn_gate_s,
++                model.layers[il].ffn_down, NULL, model.layers[il].ffn_down_s,
+                 NULL,
+                 LLM_FFN_SILU, LLM_FFN_PAR, il);
+         cb(cur, "ffn_out", il);

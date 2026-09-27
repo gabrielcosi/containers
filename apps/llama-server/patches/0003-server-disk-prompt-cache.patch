@@ -1,0 +1,1444 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 63e342776..69442914b 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -1717,6 +1717,32 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.cache_ram_mib = value;
+         }
+     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
++    add_opt(common_arg(
++        {"--cache-dir"}, "PATH",
++        "directory used to hold prompt cache states evicted from RAM and written out on shutdown; reloading one "
++        "from here is much cheaper than decoding the prompt again. created if missing. must not be shared with "
++        "another server: state files it cannot use are deleted at startup (default: disabled)",
++        [](common_params & params, const std::string & value) {
++            if (!value.empty()) {
++                std::error_code ec;
++                std::filesystem::create_directories(value, ec);
++                if (ec || !fs_is_directory(value)) {
++                    throw std::invalid_argument("cannot create directory: " + (ec ? ec.message() : value));
++                }
++            }
++            params.cache_dir = value;
++            if (!params.cache_dir.empty() && params.cache_dir[params.cache_dir.size() - 1] != DIRECTORY_SEPARATOR) {
++                params.cache_dir += DIRECTORY_SEPARATOR;
++            }
++        }
++    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_DIR"));
++    add_opt(common_arg(
++        {"--cache-disk"}, "N",
++        string_format("prompt cache size limit on disk, requires --cache-dir, in MiB (default: %d, -1 = no limit, 0 = disable)", params.cache_disk_mib),
++        [](common_params & params, int value) {
++            params.cache_disk_mib = value;
++        }
++    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_DISK"));
+     add_opt(common_arg(
+         {"-kvu", "--kv-unified"},
+         {"-no-kvu", "--no-kv-unified"},
+diff --git a/common/common.h b/common/common.h
+index 9194d3dcb..716aff2af 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -631,6 +631,8 @@ struct common_params {
+     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
+     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
+     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
++    int32_t cache_disk_mib      =    0;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
++    std::string cache_dir       =   "";  // directory for prompt cache states evicted from RAM
+ 
+     std::string public_path   = "";                                                                         // NOLINT
+     std::string api_prefix    = "";                                                                         // NOLINT
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index e95fb63ab..eeb8c15f9 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -868,6 +868,42 @@ public:
+         return metrics;
+     }
+ 
++    // on shutdown, save what the slots hold and write the whole prompt cache to disk, so the
++    // next run can resume these conversations without decoding them again
++    void persist_prompt_cache() {
++        if (!prompt_cache || prompt_cache->dir.empty() || sleeping || ctx_tgt == nullptr) {
++            return;
++        }
++
++        for (auto & slot : slots) {
++            if (slot.prompt.tokens.size() == 0) {
++                continue;
++            }
++
++            // the token list can run ahead of the memory by a sampled token that was never decoded
++            const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
++            const size_t    n_kv    = pos_max < 0 ? 0 : slot.prompt.tokens.size_up_to_pos(pos_max + 1);
++
++            if (n_kv == 0) {
++                continue;
++            }
++
++            if (n_kv < slot.prompt.tokens.size()) {
++                slot.prompt.tokens.keep_first(n_kv);
++            }
++
++            while (!slot.prompt.checkpoints.empty() && slot.prompt.checkpoints.back().pos_max > pos_max) {
++                slot.prompt.checkpoints.pop_back();
++            }
++
++            SLT_INF(slot, "saving %zu tokens to the prompt cache before exit\n", slot.prompt.tokens.size());
++
++            slot.prompt_save(*prompt_cache);
++        }
++
++        prompt_cache->flush();
++    }
++
+     void reset_metrics_bucket() {
+         metrics.reset_bucket();
+     }
+@@ -1357,6 +1393,69 @@ private:
+             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
+ 
+             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
++
++            if (!params_base.cache_dir.empty() && params_base.cache_disk_mib != 0) {
++                // the state blobs are only meaningful for this exact model and context layout
++                // a file is identified by its path, size and modification time, so replacing a
++                // model file in place invalidates the states computed with the old one
++                const auto file_id = [](const std::string & path) -> std::string {
++                    if (path.empty()) {
++                        return "-";
++                    }
++                    std::error_code ec;
++                    const auto size  = std::filesystem::file_size(path, ec);
++                    const auto mtime = std::filesystem::last_write_time(path, ec);
++                    return path + ":" + std::to_string(size) + ":" +
++                        std::to_string((long long) mtime.time_since_epoch().count());
++                };
++
++                const auto & draft = params_base.speculative.draft;
++
++                const std::string sig =
++                    file_id(params_base.model.path) + "|" +
++                    file_id(draft.mparams.path) + "|" +
++                    file_id(params_base.mmproj.path) + "|" +
++                    std::to_string(n_ctx) + "|" +
++                    std::to_string(params_base.n_parallel) + "|" +
++                    std::to_string(params_base.kv_unified) + "|" +
++                    std::to_string(params_base.swa_full) + "|" +
++                    std::to_string((int) params_base.flash_attn_type) + "|" +
++                    std::to_string((int) params_base.cache_type_k) + "|" +
++                    std::to_string((int) params_base.cache_type_v) + "|" +
++                    std::to_string((int) draft.cache_type_k) + "|" +
++                    std::to_string((int) draft.cache_type_v) + "|" +
++                    std::to_string(ctx_dft != nullptr) + "|" +
++                    std::to_string(llama_model_n_embd_inp(model_tgt)) + "|" +
++                    std::to_string(llama_vocab_n_tokens(llama_model_get_vocab(model_tgt)));
++
++                uint64_t fingerprint = 0xcbf29ce484222325ull;
++                for (const char c : sig) {
++                    fingerprint = (fingerprint ^ (uint8_t) c) * 0x100000001b3ull;
++                }
++
++                prompt_cache->dir             = params_base.cache_dir;
++                prompt_cache->fingerprint     = fingerprint;
++                prompt_cache->limit_size_disk = params_base.cache_disk_mib < 0 ?
++                    0 : 1024ull*1024ull*params_base.cache_disk_mib;
++
++                prompt_cache->has_mtmd = mctx != nullptr;
++
++                prompt_cache->needs_checkpoint =
++                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
++                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS   ||
++                    n_swa > 0;
++                prompt_cache->n_swa = n_swa;
++
++                const size_t n_adopted = prompt_cache->index_dir(ctx_tgt);
++                if (n_adopted > 0) {
++                    SRV_WRN("adopted %zu prompt cache state(s) from an earlier run (%.3f MiB)\n",
++                            n_adopted, prompt_cache->size_disk() / (1024.0 * 1024.0));
++                }
++
++                SRV_TRC("prompt cache spills to '%s', disk limit: %s\n", params_base.cache_dir.c_str(),
++                        params_base.cache_disk_mib < 0 ? "no limit" :
++                            (std::to_string(params_base.cache_disk_mib) + " MiB").c_str());
++            }
+         } else {
+             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
+         }
+@@ -4164,6 +4263,8 @@ bool server_context::load_model(common_params & params) {
+ void server_context::start_loop() {
+     auto & params = impl->params_base;
+     impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
++
++    impl->persist_prompt_cache();
+ }
+ 
+ void server_context::terminate() {
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 0d3beb313..4b338db18 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -1,5 +1,15 @@
+ #include "server-task.h"
+ 
++#include <cstdio>
++#include <algorithm>
++#include <filesystem>
++#include <fstream>
++
++#ifndef _WIN32
++#include <fcntl.h>
++#include <unistd.h>
++#endif
++
+ #include "build-info.h"
+ #include "server-chat.h"
+ #include "chat.h"
+@@ -1688,6 +1698,763 @@ json server_task_result_apply_lora::to_json() {
+ //
+ // server_prompt_cache
+ //
++// ---- disk-backed prompt cache ----------------------------------------------
++//
++// A state evicted for want of RAM is written to `dir` instead of being dropped, so a long
++// conversation survives another prompt passing through the cache, and the whole cache is
++// written out on shutdown so it survives a restart. Only the state blobs move: the token list
++// and the checkpoint positions stay resident so choosing a state never needs to touch the disk.
++//
++// File layout: header, token list, target state, draft state, checkpoints, then a trailer
++// holding the payload size and an end marker. Files are written under a temporary name,
++// synced and renamed, so a file with the final name is always complete.
++
++static const uint32_t SERVER_PROMPT_CACHE_FILE_MAGIC   = 0x50435331; // "PCS1"
++static const uint32_t SERVER_PROMPT_CACHE_FILE_END     = 0x45534350; // "PCSE"
++static const uint32_t SERVER_PROMPT_CACHE_FILE_VERSION = 3;
++
++static const size_t SERVER_PROMPT_CACHE_HEADER_SIZE  = 2*sizeof(uint32_t) + 6*sizeof(uint64_t);
++static const size_t SERVER_PROMPT_CACHE_TRAILER_SIZE = sizeof(uint64_t) + sizeof(uint32_t);
++static const size_t SERVER_PROMPT_CACHE_CKPT_HEADER  = 6*sizeof(uint64_t);
++
++// never fill the filesystem: keep this much free after a write
++static const uint64_t SERVER_PROMPT_CACHE_DISK_RESERVE = 1024ull*1024ull*1024ull;
++
++struct server_prompt_spill_job {
++    std::string path;
++    uint64_t    fingerprint = 0;
++
++    std::vector<char>    tokens;
++    std::vector<uint8_t> main;
++    std::vector<uint8_t> drft;
++
++    std::list<common_prompt_checkpoint> checkpoints;
++
++    // guarded by the cache's writer_mutex
++    bool done      = false;
++    bool ok        = false;
++    bool cancelled = false;
++};
++
++struct server_prompt_file_header {
++    uint32_t magic       = 0;
++    uint32_t version     = 0;
++    uint64_t fingerprint = 0;
++    uint64_t n_packed    = 0;
++    uint64_t n_main      = 0;
++    uint64_t n_drft      = 0;
++    uint64_t n_ckpt      = 0;
++    uint64_t n_ckpt_b    = 0;
++
++    uint64_t payload() const {
++        return n_packed + n_main + n_drft + n_ckpt_b;
++    }
++};
++
++static bool server_prompt_file_read_header(std::ifstream & file, server_prompt_file_header & hdr) {
++    file.read(reinterpret_cast<char *>(&hdr.magic),       sizeof(hdr.magic));
++    file.read(reinterpret_cast<char *>(&hdr.version),     sizeof(hdr.version));
++    file.read(reinterpret_cast<char *>(&hdr.fingerprint), sizeof(hdr.fingerprint));
++    file.read(reinterpret_cast<char *>(&hdr.n_packed),    sizeof(hdr.n_packed));
++    file.read(reinterpret_cast<char *>(&hdr.n_main),      sizeof(hdr.n_main));
++    file.read(reinterpret_cast<char *>(&hdr.n_drft),      sizeof(hdr.n_drft));
++    file.read(reinterpret_cast<char *>(&hdr.n_ckpt),      sizeof(hdr.n_ckpt));
++    file.read(reinterpret_cast<char *>(&hdr.n_ckpt_b),    sizeof(hdr.n_ckpt_b));
++
++    return (bool) file;
++}
++
++// checks the header against the file size and the trailer, which catches a file cut short
++// by a crash or a full disk before anything is read from it
++static const char * server_prompt_file_check(std::ifstream & file, const server_prompt_file_header & hdr, uint64_t size_file, uint64_t fingerprint) {
++    if (hdr.magic != SERVER_PROMPT_CACHE_FILE_MAGIC || hdr.version != SERVER_PROMPT_CACHE_FILE_VERSION) {
++        return "not a state file of this version";
++    }
++
++    if (hdr.fingerprint != fingerprint) {
++        return "belongs to a different model or context";
++    }
++
++    if (hdr.n_packed == 0 || hdr.n_packed % sizeof(llama_token) != 0 || hdr.n_main == 0) {
++        return "has no usable state";
++    }
++
++    if (hdr.n_ckpt_b < hdr.n_ckpt * SERVER_PROMPT_CACHE_CKPT_HEADER ||
++        SERVER_PROMPT_CACHE_HEADER_SIZE + hdr.payload() + SERVER_PROMPT_CACHE_TRAILER_SIZE != size_file) {
++        return "is truncated";
++    }
++
++    const auto pos = file.tellg();
++
++    uint64_t payload = 0;
++    uint32_t end     = 0;
++
++    file.seekg((std::streamoff) (size_file - SERVER_PROMPT_CACHE_TRAILER_SIZE));
++    file.read(reinterpret_cast<char *>(&payload), sizeof(payload));
++    file.read(reinterpret_cast<char *>(&end),     sizeof(end));
++    file.seekg(pos);
++
++    if (!file || payload != hdr.payload() || end != SERVER_PROMPT_CACHE_FILE_END) {
++        return "is truncated";
++    }
++
++    return nullptr;
++}
++
++// the checkpoint positions of a file, without reading the checkpoint data. `file` must be
++// positioned at the first checkpoint.
++static bool server_prompt_file_read_checkpoint_pos(std::ifstream & file, uint64_t n_ckpt, std::vector<server_prompt_checkpoint_pos> & res) {
++    res.clear();
++    res.reserve(n_ckpt);
++
++    for (uint64_t i = 0; i < n_ckpt; ++i) {
++        uint64_t n_tokens = 0;
++        int64_t  pos_min  = 0;
++        int64_t  pos_max  = 0;
++        uint64_t sizes[3] = { 0, 0, 0 };
++
++        file.read(reinterpret_cast<char *>(&n_tokens), sizeof(n_tokens));
++        file.read(reinterpret_cast<char *>(&pos_min),  sizeof(pos_min));
++        file.read(reinterpret_cast<char *>(&pos_max),  sizeof(pos_max));
++        file.read(reinterpret_cast<char *>(sizes),     sizeof(sizes));
++
++        if (!file) {
++            return false;
++        }
++
++        res.push_back({ (int64_t) n_tokens, (llama_pos) pos_min, (llama_pos) pos_max });
++
++        file.seekg((std::streamoff) (sizes[0] + sizes[1] + sizes[2]), std::ios::cur);
++    }
++
++    return (bool) file;
++}
++
++static bool server_prompt_file_write(const server_prompt_spill_job & job) {
++    const std::string path_tmp = job.path + ".tmp";
++
++    FILE * f = std::fopen(path_tmp.c_str(), "wb");
++    if (!f) {
++        SRV_WRN(" - cannot open prompt cache file '%s' for writing\n", path_tmp.c_str());
++        return false;
++    }
++
++    uint64_t n_ckpt_b = 0;
++    for (const auto & ckpt : job.checkpoints) {
++        n_ckpt_b += SERVER_PROMPT_CACHE_CKPT_HEADER + ckpt.data_tgt.size() + ckpt.data_dft.size() + ckpt.data_spec.size();
++    }
++
++    server_prompt_file_header hdr;
++    hdr.magic       = SERVER_PROMPT_CACHE_FILE_MAGIC;
++    hdr.version     = SERVER_PROMPT_CACHE_FILE_VERSION;
++    hdr.fingerprint = job.fingerprint;
++    hdr.n_packed    = job.tokens.size();
++    hdr.n_main      = job.main.size();
++    hdr.n_drft      = job.drft.size();
++    hdr.n_ckpt      = job.checkpoints.size();
++    hdr.n_ckpt_b    = n_ckpt_b;
++
++    bool ok = true;
++    const auto put = [&](const void * data, size_t size) {
++        if (ok && size > 0) {
++            ok = std::fwrite(data, 1, size, f) == size;
++        }
++    };
++
++    put(&hdr.magic,       sizeof(hdr.magic));
++    put(&hdr.version,     sizeof(hdr.version));
++    put(&hdr.fingerprint, sizeof(hdr.fingerprint));
++    put(&hdr.n_packed,    sizeof(hdr.n_packed));
++    put(&hdr.n_main,      sizeof(hdr.n_main));
++    put(&hdr.n_drft,      sizeof(hdr.n_drft));
++    put(&hdr.n_ckpt,      sizeof(hdr.n_ckpt));
++    put(&hdr.n_ckpt_b,    sizeof(hdr.n_ckpt_b));
++    put(job.tokens.data(), job.tokens.size());
++    put(job.main.data(),   job.main.size());
++    put(job.drft.data(),   job.drft.size());
++
++    for (const auto & ckpt : job.checkpoints) {
++        const uint64_t n_tokens = (uint64_t) ckpt.n_tokens;
++        const int64_t  pos_min  = (int64_t)  ckpt.pos_min;
++        const int64_t  pos_max  = (int64_t)  ckpt.pos_max;
++        const uint64_t sizes[3] = { ckpt.data_tgt.size(), ckpt.data_dft.size(), ckpt.data_spec.size() };
++
++        put(&n_tokens, sizeof(n_tokens));
++        put(&pos_min,  sizeof(pos_min));
++        put(&pos_max,  sizeof(pos_max));
++        put(sizes,     sizeof(sizes));
++        put(ckpt.data_tgt.data(),  sizes[0]);
++        put(ckpt.data_dft.data(),  sizes[1]);
++        put(ckpt.data_spec.data(), sizes[2]);
++    }
++
++    const uint64_t payload = hdr.payload();
++    put(&payload, sizeof(payload));
++    put(&SERVER_PROMPT_CACHE_FILE_END, sizeof(SERVER_PROMPT_CACHE_FILE_END));
++
++    ok = ok && std::fflush(f) == 0;
++#ifndef _WIN32
++    ok = ok && fsync(fileno(f)) == 0;
++#endif
++    ok = (std::fclose(f) == 0) && ok;
++
++    if (!ok) {
++        SRV_WRN(" - failed to write prompt cache file '%s'\n", path_tmp.c_str());
++        std::remove(path_tmp.c_str());
++        return false;
++    }
++
++    std::error_code ec;
++    std::filesystem::rename(path_tmp, job.path, ec);
++    if (ec) {
++        SRV_WRN(" - cannot rename prompt cache file '%s': %s\n", path_tmp.c_str(), ec.message().c_str());
++        std::remove(path_tmp.c_str());
++        return false;
++    }
++
++#ifndef _WIN32
++    // make the rename itself durable
++    const std::string dir = std::filesystem::path(job.path).parent_path().string();
++    const int fd = open(dir.c_str(), O_RDONLY);
++    if (fd >= 0) {
++        fsync(fd);
++        close(fd);
++    }
++#endif
++
++    return true;
++}
++
++// the number of tokens of `tokens_new` that restoring a state can keep. A state that diverges
++// from the new prompt before its own end can only be rewound on recurrent or SWA memory by
++// restoring a checkpoint at or before the divergence, so only those count.
++static int server_prompt_n_reusable(
++        const server_tokens & tokens,
++        const std::vector<server_prompt_checkpoint_pos> & checkpoints,
++        const server_tokens & tokens_new,
++        bool needs_checkpoint,
++        int32_t n_swa) {
++    const int lcp = tokens.get_common_prefix(tokens_new);
++
++    if (!needs_checkpoint || lcp >= (int) tokens.size()) {
++        return lcp;
++    }
++
++    const llama_pos pos_next      = tokens.pos_next(lcp);
++    const bool      has_new       = lcp < (int) tokens_new.size();
++    const llama_pos pos_min_thold = std::max(0, pos_next - n_swa - (has_new ? 0 : 1));
++
++    for (auto it = checkpoints.rbegin(); it != checkpoints.rend(); ++it) {
++        if (it->pos_max > pos_next) {
++            continue;
++        }
++
++        if (it->pos_min >= pos_min_thold && it->pos_min != 0) {
++            continue;
++        }
++
++        const llama_pos pos_ckpt = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
++
++        return (int) std::min(tokens.size_up_to_pos(pos_ckpt), (size_t) it->n_tokens);
++    }
++
++    return 0;
++}
++
++static std::vector<server_prompt_checkpoint_pos> server_prompt_checkpoint_positions(const std::list<common_prompt_checkpoint> & checkpoints) {
++    std::vector<server_prompt_checkpoint_pos> res;
++    res.reserve(checkpoints.size());
++
++    for (const auto & ckpt : checkpoints) {
++        res.push_back({ ckpt.n_tokens, ckpt.pos_min, ckpt.pos_max });
++    }
++
++    return res;
++}
++
++int server_prompt_cache::n_reusable(const server_prompt_cache_state & state, const server_tokens & tokens_new) const {
++    if (state.on_disk()) {
++        return server_prompt_n_reusable(state.prompt.tokens, state.checkpoints_disk, tokens_new, needs_checkpoint, n_swa);
++    }
++
++    return server_prompt_n_reusable(state.prompt.tokens, server_prompt_checkpoint_positions(state.prompt.checkpoints),
++            tokens_new, needs_checkpoint, n_swa);
++}
++
++void server_prompt_cache::writer_start() {
++    if (!writer.joinable()) {
++        writer = std::thread([this]() { writer_loop(); });
++    }
++}
++
++void server_prompt_cache::writer_loop() {
++    while (true) {
++        std::shared_ptr<server_prompt_spill_job> job;
++
++        {
++            std::unique_lock<std::mutex> lock(writer_mutex);
++            writer_cv.wait(lock, [this]() { return writer_stop || !writer_queue.empty(); });
++
++            if (writer_queue.empty()) {
++                return;
++            }
++
++            job = writer_queue.front();
++
++            if (job->cancelled) {
++                writer_queue.pop_front();
++                job->done = true;
++                writer_cv_done.notify_all();
++                continue;
++            }
++        }
++
++        const int64_t t_start_us = ggml_time_us();
++        const bool ok = server_prompt_file_write(*job);
++        const double  t_ms = (ggml_time_us() - t_start_us) / 1000.0;
++
++        {
++            std::unique_lock<std::mutex> lock(writer_mutex);
++            writer_queue.pop_front();
++
++            if (ok && job->cancelled) {
++                std::remove(job->path.c_str());
++            }
++
++            if (ok) {
++                const double size_mib = (job->tokens.size() + job->main.size() + job->drft.size()) / (1024.0 * 1024.0);
++                SRV_INF(" - wrote prompt cache file '%s' (%.3f MiB + %zu checkpoints, %.2f ms)\n",
++                        job->path.c_str(), size_mib, job->checkpoints.size(), t_ms);
++            }
++
++            job->done = true;
++            job->ok   = ok;
++
++            // the file holds it now
++            job->tokens = {};
++            job->main   = {};
++            job->drft   = {};
++            job->checkpoints.clear();
++        }
++
++        writer_cv_done.notify_all();
++    }
++}
++
++void server_prompt_cache::writer_wait(const std::shared_ptr<server_prompt_spill_job> & job) {
++    std::unique_lock<std::mutex> lock(writer_mutex);
++    writer_cv_done.wait(lock, [&job]() { return job->done; });
++}
++
++// A previous run's state files are still valid if they describe the same model and context,
++// so adopt them instead of decoding those prompts again. Anything foreign or unreadable is
++// deleted: a crash skips the shutdown flush, and the directory must not grow without bound.
++// The directory must belong to a single server for this reason.
++size_t server_prompt_cache::index_dir(const llama_context * ctx) {
++    if (dir.empty()) {
++        return 0;
++    }
++
++    struct found_file {
++        std::filesystem::file_time_type mtime;
++        size_t      idx;
++        std::string path;
++    };
++
++    std::vector<found_file> found;
++
++    std::error_code ec;
++    for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
++        const std::string name = it->path().filename().string();
++
++        if (name.rfind("state-", 0) != 0) {
++            continue;
++        }
++
++        // a write that never finished
++        if (it->path().extension() == ".tmp") {
++            SRV_WRN(" - removing incomplete prompt cache file '%s'\n", it->path().string().c_str());
++            std::remove(it->path().string().c_str());
++            continue;
++        }
++
++        if (it->path().extension() != ".bin") {
++            continue;
++        }
++
++        size_t idx = 0;
++        try {
++            idx = (size_t) std::stoull(name.substr(6));
++        } catch (const std::exception &) {
++            continue;
++        }
++
++        std::error_code ec_time;
++        const auto mtime = std::filesystem::last_write_time(it->path(), ec_time);
++
++        found.push_back({ mtime, idx, it->path().string() });
++    }
++
++    if (ec) {
++        SRV_WRN(" - cannot read the prompt cache directory '%s': %s\n", dir.c_str(), ec.message().c_str());
++        return 0;
++    }
++
++    for (const auto & f : found) {
++        i_file = std::max(i_file, f.idx + 1);
++    }
++
++    // most recently used first, so the disk limit keeps the newest states
++    std::sort(found.begin(), found.end(), [](const found_file & a, const found_file & b) {
++        return a.mtime != b.mtime ? a.mtime > b.mtime : a.idx > b.idx;
++    });
++
++    std::vector<server_prompt_cache_state> adopted;
++    size_t size_adopted = 0;
++
++    for (const auto & f : found) {
++        const std::string & path_cur = f.path;
++
++        const auto discard = [&path_cur](const char * reason) {
++            SRV_WRN(" - discarding prompt cache file '%s': %s\n", path_cur.c_str(), reason);
++            std::remove(path_cur.c_str());
++        };
++
++        std::error_code ec_size;
++        const uint64_t size_file = std::filesystem::file_size(path_cur, ec_size);
++
++        std::ifstream file(path_cur, std::ios::binary);
++        if (!file || ec_size) {
++            discard("cannot be opened");
++            continue;
++        }
++
++        server_prompt_file_header hdr;
++        if (!server_prompt_file_read_header(file, hdr)) {
++            discard("is truncated");
++            continue;
++        }
++
++        if (const char * err = server_prompt_file_check(file, hdr, size_file, fingerprint)) {
++            discard(err);
++            continue;
++        }
++
++        if (limit_size_disk > 0 && size_adopted + size_file > limit_size_disk) {
++            discard("does not fit the prompt cache disk limit");
++            continue;
++        }
++
++        llama_tokens packed(hdr.n_packed / sizeof(llama_token));
++        file.read(reinterpret_cast<char *>(packed.data()), (std::streamsize) hdr.n_packed);
++        if (!file) {
++            discard("is truncated");
++            continue;
++        }
++
++        file.seekg((std::streamoff) (hdr.n_main + hdr.n_drft), std::ios::cur);
++
++        std::vector<server_prompt_checkpoint_pos> ckpts;
++        if (!server_prompt_file_read_checkpoint_pos(file, hdr.n_ckpt, ckpts)) {
++            discard("is truncated");
++            continue;
++        }
++
++        server_prompt prompt_cur;
++        try {
++            prompt_cur.tokens = server_tokens::deserialize(packed, has_mtmd);
++        } catch (const std::exception & err) {
++            discard(err.what());
++            continue;
++        }
++
++        // the tokens have to mean the same thing to this model as they did to the last one
++        if (!prompt_cur.tokens.validate(ctx)) {
++            discard("holds tokens this model cannot represent");
++            continue;
++        }
++
++        server_prompt_cache_state state;
++        state.prompt           = std::move(prompt_cur);
++        state.path             = path_cur;
++        state.size_disk        = size_file;
++        state.checkpoints_disk = std::move(ckpts);
++
++        adopted.push_back(std::move(state));
++        size_adopted += size_file;
++    }
++
++    // the list is least recently used first
++    for (auto it = adopted.rbegin(); it != adopted.rend(); ++it) {
++        states.push_back(std::move(*it));
++    }
++
++    return adopted.size();
++}
++
++void server_prompt_cache::flush() {
++    if (dir.empty()) {
++        return;
++    }
++
++    const int64_t t_start_us = ggml_time_us();
++
++    size_t n_spilled = 0;
++
++    for (auto & state : states) {
++        if (!state.on_disk() && spill(state)) {
++            n_spilled++;
++        }
++    }
++
++    size_t n_ok = 0;
++
++    for (auto it = states.begin(); it != states.end(); ) {
++        if (it->job) {
++            writer_wait(it->job);
++
++            const bool ok = it->job->ok;
++            it->job.reset();
++
++            if (!ok) {
++                it = drop(it);
++                continue;
++            }
++
++            n_ok++;
++        }
++
++        ++it;
++    }
++
++    if (n_spilled > 0 || n_ok > 0) {
++        SRV_WRN("prompt cache: wrote %zu state(s) to disk (%zu newly spilled), %zu on disk, %.3f MiB, %.2f ms\n",
++                n_ok, n_spilled, states.size(), size_disk() / (1024.0 * 1024.0), (ggml_time_us() - t_start_us) / 1000.0);
++    }
++}
++
++server_prompt_cache::~server_prompt_cache() {
++    // normally already flushed when the server loop ended; this catches any other exit path
++    flush();
++
++    {
++        std::unique_lock<std::mutex> lock(writer_mutex);
++        writer_stop = true;
++    }
++    writer_cv.notify_all();
++
++    if (writer.joinable()) {
++        writer.join();
++    }
++}
++
++bool server_prompt_cache::spill(server_prompt_cache_state & state) {
++    if (dir.empty() || state.on_disk()) {
++        return false;
++    }
++
++    auto job = std::make_shared<server_prompt_spill_job>();
++
++    try {
++        job->tokens = state.prompt.tokens.serialize();
++    } catch (const std::exception & err) {
++        SRV_WRN(" - cannot serialize tokens for the prompt cache file: %s\n", err.what());
++        return false;
++    }
++
++    size_t size_ckpt = 0;
++    for (const auto & ckpt : state.prompt.checkpoints) {
++        size_ckpt += SERVER_PROMPT_CACHE_CKPT_HEADER + ckpt.data_tgt.size() + ckpt.data_dft.size() + ckpt.data_spec.size();
++    }
++
++    const size_t size_file = SERVER_PROMPT_CACHE_HEADER_SIZE + job->tokens.size() +
++        state.data.main.size() + state.data.drft.size() + size_ckpt + SERVER_PROMPT_CACHE_TRAILER_SIZE;
++
++    make_room_disk(size_file);
++
++    if (limit_size_disk > 0 && size_disk() + size_file > limit_size_disk) {
++        SRV_WRN(" - prompt state %.3f MiB does not fit the prompt cache disk limit %.3f MiB\n",
++                size_file / (1024.0 * 1024.0), limit_size_disk / (1024.0 * 1024.0));
++        return false;
++    }
++
++    // files still queued count against the free space too
++    size_t size_pending = 0;
++    for (const auto & cur : states) {
++        if (cur.job) {
++            size_pending += cur.size_disk;
++        }
++    }
++
++    std::error_code ec;
++    const auto space = std::filesystem::space(dir, ec);
++    if (ec || space.available < size_file + size_pending + SERVER_PROMPT_CACHE_DISK_RESERVE) {
++        SRV_WRN(" - not enough free space in '%s' for a %.3f MiB prompt state\n", dir.c_str(), size_file / (1024.0 * 1024.0));
++        return false;
++    }
++
++    job->path        = dir + "state-" + std::to_string(i_file++) + ".bin";
++    job->fingerprint = fingerprint;
++    job->main        = std::move(state.data.main);
++    job->drft        = std::move(state.data.drft);
++    job->checkpoints = std::move(state.prompt.checkpoints);
++
++    state.data.main = {};
++    state.data.drft = {};
++    state.prompt.checkpoints.clear();
++
++    state.checkpoints_disk = server_prompt_checkpoint_positions(job->checkpoints);
++    state.path             = job->path;
++    state.size_disk        = size_file;
++    state.job              = job;
++
++    SRV_WRN(" - spilling prompt cache entry to disk (%d tokens, %zu checkpoints, %.3f MiB)\n",
++            state.prompt.n_tokens(), state.checkpoints_disk.size(), size_file / (1024.0 * 1024.0));
++
++    writer_start();
++
++    {
++        std::unique_lock<std::mutex> lock(writer_mutex);
++        writer_queue.push_back(job);
++    }
++    writer_cv.notify_one();
++
++    return true;
++}
++
++bool server_prompt_cache::read_file(server_prompt_cache_state & state, server_prompt_data & data, std::list<common_prompt_checkpoint> & checkpoints) {
++    if (state.job) {
++        writer_wait(state.job);
++
++        const bool ok = state.job->ok;
++        state.job.reset();
++
++        if (!ok) {
++            return false;
++        }
++    }
++
++    std::error_code ec;
++    const uint64_t size_file = std::filesystem::file_size(state.path, ec);
++
++    std::ifstream file(state.path, std::ios::binary);
++    if (!file || ec) {
++        SRV_WRN(" - cannot open prompt cache file '%s' for reading\n", state.path.c_str());
++        return false;
++    }
++
++    server_prompt_file_header hdr;
++    if (!server_prompt_file_read_header(file, hdr)) {
++        SRV_WRN(" - prompt cache file '%s' is truncated\n", state.path.c_str());
++        return false;
++    }
++
++    if (const char * err = server_prompt_file_check(file, hdr, size_file, fingerprint)) {
++        SRV_WRN(" - prompt cache file '%s' %s\n", state.path.c_str(), err);
++        return false;
++    }
++
++    data.main.resize(hdr.n_main);
++    data.drft.resize(hdr.n_drft);
++
++    file.seekg((std::streamoff) hdr.n_packed, std::ios::cur);
++    file.read(reinterpret_cast<char *>(data.main.data()), (std::streamsize) hdr.n_main);
++    file.read(reinterpret_cast<char *>(data.drft.data()), (std::streamsize) hdr.n_drft);
++
++    checkpoints.clear();
++
++    for (uint64_t i = 0; i < hdr.n_ckpt && file; ++i) {
++        uint64_t n_tokens = 0;
++        int64_t  pos_min  = 0;
++        int64_t  pos_max  = 0;
++        uint64_t sizes[3] = { 0, 0, 0 };
++
++        file.read(reinterpret_cast<char *>(&n_tokens), sizeof(n_tokens));
++        file.read(reinterpret_cast<char *>(&pos_min),  sizeof(pos_min));
++        file.read(reinterpret_cast<char *>(&pos_max),  sizeof(pos_max));
++        file.read(reinterpret_cast<char *>(sizes),     sizeof(sizes));
++
++        if (!file || sizes[0] + sizes[1] + sizes[2] > hdr.n_ckpt_b) {
++            file.setstate(std::ios::failbit);
++            break;
++        }
++
++        auto & ckpt = checkpoints.emplace_back();
++
++        ckpt.n_tokens = (int64_t) n_tokens;
++        ckpt.pos_min  = (llama_pos) pos_min;
++        ckpt.pos_max  = (llama_pos) pos_max;
++
++        ckpt.data_tgt .resize(sizes[0]);
++        ckpt.data_dft .resize(sizes[1]);
++        ckpt.data_spec.resize(sizes[2]);
++
++        file.read(reinterpret_cast<char *>(ckpt.data_tgt .data()), (std::streamsize) sizes[0]);
++        file.read(reinterpret_cast<char *>(ckpt.data_dft .data()), (std::streamsize) sizes[1]);
++        file.read(reinterpret_cast<char *>(ckpt.data_spec.data()), (std::streamsize) sizes[2]);
++    }
++
++    if (!file) {
++        SRV_WRN(" - prompt cache file '%s' is truncated\n", state.path.c_str());
++        return false;
++    }
++
++    // most recently used, for the next run's adoption order
++    std::filesystem::last_write_time(state.path, std::filesystem::file_time_type::clock::now(), ec);
++
++    return true;
++}
++
++std::list<server_prompt_cache_state>::iterator server_prompt_cache::drop(std::list<server_prompt_cache_state>::iterator it) {
++    bool remove_now = it->on_disk();
++
++    if (it->job) {
++        std::unique_lock<std::mutex> lock(writer_mutex);
++
++        if (!it->job->done) {
++            // the writer deletes the file once it is done with it
++            it->job->cancelled = true;
++            remove_now = false;
++        } else {
++            remove_now = it->job->ok;
++        }
++    }
++
++    if (remove_now) {
++        std::remove(it->path.c_str());
++    }
++
++    return states.erase(it);
++}
++
++void server_prompt_cache::make_room_disk(size_t need) {
++    if (limit_size_disk == 0) {
++        return;
++    }
++
++    for (auto it = states.begin(); it != states.end() && size_disk() + need > limit_size_disk; ) {
++        if (!it->on_disk()) {
++            ++it;
++            continue;
++        }
++
++        SRV_WRN(" - prompt cache disk limit reached, removing least recently used entry (size = %.3f MiB)\n",
++                it->size_disk / (1024.0 * 1024.0));
++
++        it = drop(it);
++    }
++}
++
++size_t server_prompt_cache::size_disk() const {
++    size_t res = 0;
++
++    for (const auto & state : states) {
++        res += state.size_disk;
++    }
++
++    return res;
++}
++
+ size_t server_prompt_cache::size() const {
+     size_t res = 0;
+ 
+@@ -1702,6 +2469,10 @@ size_t server_prompt_cache::n_tokens() const {
+     size_t res = 0;
+ 
+     for (const auto & state : states) {
++        if (state.on_disk()) {
++            continue;
++        }
++
+         res += state.prompt.n_tokens();
+     }
+ 
+@@ -1727,8 +2498,9 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+ 
+     const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
+ 
+-    // skip over-limit entries to avoid disturbing the cache
+-    if (limit_size > 0 && state_size_new > limit_size) {
++    // skip over-limit entries to avoid disturbing the cache. With a cache directory the entry
++    // is still taken: update() moves it straight to disk.
++    if (limit_size > 0 && state_size_new > limit_size && dir.empty()) {
+         SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
+                 state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
+         return nullptr;
+@@ -1741,7 +2513,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+         if (len == (int) it->prompt.tokens.size()) {
+             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
+ 
+-            it = states.erase(it);
++            it = drop(it);
+         } else {
+             ++it;
+         }
+@@ -1749,11 +2521,23 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+ 
+     if (limit_size > 0) {
+         // make room before allocating the new vectors to avoid breaching the limit
+-        while (!states.empty() && size() + state_size_new > limit_size) {
+-            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
+-                    states.front().size() / (1024.0 * 1024.0));
++        for (auto it = states.begin(); it != states.end() && size() + state_size_new > limit_size; ) {
++            if (it->on_disk()) {
++                ++it;
++                continue;
++            }
++
++            const double size_mib = it->size() / (1024.0 * 1024.0);
+ 
+-            states.pop_front();
++            // prefer moving the state out to disk: reading it back beats decoding the prompt again
++            if (spill(*it)) {
++                ++it;
++                continue;
++            }
++
++            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n", size_mib);
++
++            it = drop(it);
+         }
+     }
+ 
+@@ -1776,16 +2560,17 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+         return nullptr;
+     }
+ 
+-    states.push_back({
+-        /*.prompt =*/ {
+-            /*.tokens      =*/ prompt.tokens.clone(),
+-            /*.checkpoints =*/ prompt.checkpoints,
+-        },
+-        /*.data   =*/ {
+-            /*.main =*/ std::move(state_data_tgt),
+-            /*.drft =*/ std::move(state_data_dft),
+-        },
+-    });
++    server_prompt_cache_state state;
++    state.prompt = {
++        /*.tokens      =*/ prompt.tokens.clone(),
++        /*.checkpoints =*/ prompt.checkpoints,
++    };
++    state.data = {
++        /*.main =*/ std::move(state_data_tgt),
++        /*.drft =*/ std::move(state_data_dft),
++    };
++
++    states.push_back(std::move(state));
+ 
+     return &states.back();
+ }
+@@ -1793,86 +2578,177 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+ 
+-    float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
+-    float f_sim_best  = float(lcp_best) / tokens_new.size();
++    const int n_base = server_prompt_n_reusable(prompt.tokens, server_prompt_checkpoint_positions(prompt.checkpoints),
++            tokens_new, needs_checkpoint, n_swa);
+ 
+-    SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
++    SRV_TRC(" - looking for better prompt, base lcp = %d, reusable = %d\n", lcp_best, n_base);
+ 
+     auto it_best = states.end();
++    int  n_best  = n_base;
+ 
+-    // find the most similar cached prompt, that would also preserve the most context
++    // find the cached prompt that keeps the most of the new prompt without decoding it again
+     for (auto it = states.begin(); it != states.end(); ++it) {
+         const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
++        const int n_cur   = n_reusable(*it, tokens_new);
+ 
+         const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
+-        const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
+ 
+-        SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
++        SRV_TRC("   - prompt with length %7zu, lcp = %7d, reusable = %7d, f_keep = %.3f%s\n",
++                it->prompt.tokens.size(), lcp_cur, n_cur, f_keep_cur, it->on_disk() ? " (disk)" : "");
+ 
+-        // don't trash large prompts
+-        if (f_keep_cur < 0.25f) {
++        // don't trash large prompts: a resident state is consumed when it is restored,
++        // a state on disk stays there
++        if (!it->on_disk() && f_keep_cur < 0.25f) {
+             continue;
+         }
+ 
+-        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
+-            f_keep_best = f_keep_cur;
+-            f_sim_best  = f_sim_cur;
+-
++        // prefer the resident one when equal, it does not have to be read back
++        if (n_cur > n_best || (n_cur == n_best && it_best != states.end() && it_best->on_disk() && !it->on_disk())) {
++            n_best  = n_cur;
+             it_best = it;
+         }
+     }
+ 
+-    if (it_best != states.end()) {
+-        SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
++    if (it_best == states.end()) {
++        return true;
++    }
+ 
+-        {
+-            auto & data = it_best->data.main;
++    SRV_TRC(" - found better prompt, reusable = %d\n", n_best);
+ 
+-            const size_t size = data.size();
+-            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
+-            if (n != size) {
+-                SRV_ERR("failed to restore state with size %zu\n", size);
++    if (it_best->on_disk()) {
++        const int64_t t_start_us = ggml_time_us();
++        const double  size_mib   = it_best->size_disk / (1024.0 * 1024.0);
++
++        server_prompt_data data;
++        std::list<common_prompt_checkpoint> checkpoints;
++
++        if (!read_file(*it_best, data, checkpoints)) {
++            SRV_WRN("%s", " - failed to read the spilled prompt state, dropping it\n");
++
++            drop(it_best);
++
++            return true;
++        }
++
++        const double t_read_ms = (ggml_time_us() - t_start_us) / 1000.0;
++
++        if (llama_state_seq_set_data_ext(ctx_tgt, data.main.data(), data.main.size(), id_slot, 0) != data.main.size()) {
++            SRV_ERR("failed to restore state with size %zu, dropping it\n", data.main.size());
++
++            drop(it_best);
++
++            return false;
++        }
++
++        if (!data.drft.empty()) {
++            GGML_ASSERT(ctx_dft);
++
++            if (llama_state_seq_set_data_ext(ctx_dft, data.drft.data(), data.drft.size(), id_slot, 0) != data.drft.size()) {
++                SRV_WRN("failed to restore draft state with size %zu, dropping it\n", data.drft.size());
++
++                drop(it_best);
+ 
+                 return false;
+             }
++        }
+ 
+-            data.clear();
+-            data.shrink_to_fit();
++        SRV_WRN(" - restored a prompt state from disk (%d tokens, %zu checkpoints, %.3f MiB, read %.2f ms, total %.2f ms)\n",
++                it_best->prompt.n_tokens(), checkpoints.size(), size_mib, t_read_ms, (ggml_time_us() - t_start_us) / 1000.0);
++
++        prompt.tokens      = it_best->prompt.tokens.clone();
++        prompt.checkpoints = std::move(checkpoints);
++
++        // the file stays: a later prompt may branch from the same point, and a crash before
++        // this slot is saved again must not lose it. Mark it most recently used.
++        states.splice(states.end(), states, it_best);
++
++        return true;
++    }
++
++    {
++        auto & data = it_best->data.main;
++
++        const size_t size = data.size();
++        const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
++        if (n != size) {
++            SRV_ERR("failed to restore state with size %zu\n", size);
++
++            return false;
+         }
+ 
+-        {
+-            auto & data = it_best->data.drft;
++        data.clear();
++        data.shrink_to_fit();
++    }
+ 
+-            if (!data.empty()) {
+-                GGML_ASSERT(ctx_dft);
++    {
++        auto & data = it_best->data.drft;
+ 
+-                const size_t size = data.size();
+-                const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
+-                if (n != size) {
+-                    SRV_WRN("failed to restore state with size %zu\n", size);
++        if (!data.empty()) {
++            GGML_ASSERT(ctx_dft);
+ 
+-                    return false;
+-                }
++            const size_t size = data.size();
++            const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
++            if (n != size) {
++                SRV_WRN("failed to restore state with size %zu\n", size);
+ 
+-                data.clear();
+-                data.shrink_to_fit();
++                return false;
+             }
++
++            data.clear();
++            data.shrink_to_fit();
+         }
++    }
+ 
+-        prompt = std::move(it_best->prompt);
++    prompt = std::move(it_best->prompt);
+ 
+-        states.erase(it_best);
+-    }
++    states.erase(it_best);
+ 
+     return true;
+ }
+ 
+ void server_prompt_cache::update() {
++    // forget states whose file could not be written
++    for (auto it = states.begin(); it != states.end(); ) {
++        if (it->job) {
++            bool done = false;
++            bool ok   = false;
++            {
++                std::unique_lock<std::mutex> lock(writer_mutex);
++                done = it->job->done;
++                ok   = it->job->ok;
++            }
++
++            if (done) {
++                it->job.reset();
++
++                if (!ok) {
++                    SRV_WRN("%s", " - dropping a prompt cache entry whose file could not be written\n");
++                    it = states.erase(it);
++                    continue;
++                }
++            }
++        }
++
++        ++it;
++    }
++
+     if (limit_size > 0) {
+-        while (!states.empty() && size() > limit_size) {
+-            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
++        for (auto it = states.begin(); it != states.end() && size() > limit_size; ) {
++            if (it->on_disk()) {
++                ++it;
++                continue;
++            }
++
++            const double size_mib = it->size() / (1024.0 * 1024.0);
++
++            if (spill(*it)) {
++                ++it;
++                continue;
++            }
++
++            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", size_mib);
+ 
+-            states.pop_front();
++            it = drop(it);
+         }
+     }
+ 
+@@ -1883,19 +2759,34 @@ void server_prompt_cache::update() {
+     const size_t limit_tokens_cur = limit_size > 0 ? std::max<size_t>(limit_tokens, limit_size/size_per_token) : limit_tokens;
+ 
+     if (limit_tokens > 0) {
+-        while (!states.empty() && n_tokens() > limit_tokens_cur) {
++        for (auto it = states.begin(); it != states.end() && n_tokens() > limit_tokens_cur; ) {
++            if (it->on_disk()) {
++                ++it;
++                continue;
++            }
++
++            const double size_mib = it->size() / (1024.0 * 1024.0);
++
++            if (spill(*it)) {
++                ++it;
++                continue;
++            }
++
+             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
+-                    limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
++                    limit_tokens, limit_tokens_cur, size_mib);
+ 
+-            states.pop_front();
++            it = drop(it);
+         }
+     }
+ 
+-    SRV_TRC(" - cache state: %zu prompts, %.3f MiB (limits: %.3f MiB, %zu tokens, %zu est)\n",
+-            states.size(), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
++    SRV_TRC(" - cache state: %zu prompts, %.3f MiB (limits: %.3f MiB, %zu tokens, %zu est), %.3f MiB on disk\n",
++            states.size(), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur,
++            size_disk() / (1024.0 * 1024.0));
+ 
+     for (const auto & state : states) {
+-        SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
+-                (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0));
++        SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB%s\n",
++                (const void *)&state, state.prompt.n_tokens(),
++                state.on_disk() ? state.checkpoints_disk.size() : state.prompt.checkpoints.size(),
++                (state.on_disk() ? state.size_disk : state.size()) / (1024.0 * 1024.0), state.on_disk() ? " (disk)" : "");
+     }
+ }
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index 9c99143f8..6fe1ed51f 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -7,6 +7,11 @@
+ #include <unordered_set>
+ #include <list>
+ #include <map>
++#include <memory>
++#include <mutex>
++#include <thread>
++#include <deque>
++#include <condition_variable>
+ 
+ // TODO: prevent including the whole server-common.h as we only use server_tokens
+ #include "server-common.h"
+@@ -594,10 +599,37 @@ struct server_prompt_data {
+     }
+ };
+ 
++// position range of a checkpoint held in a state file, kept resident so the file does not
++// have to be read to tell whether a checkpoint would make a spilled state reusable
++struct server_prompt_checkpoint_pos {
++    int64_t   n_tokens;
++    llama_pos pos_min;
++    llama_pos pos_max;
++};
++
++// a state file being written by the cache's writer thread
++struct server_prompt_spill_job;
++
+ struct server_prompt_cache_state {
+     server_prompt prompt;
+     server_prompt_data data;
+ 
++    // when non-empty, the state data lives in this file instead of in `data`.
++    // the token list stays resident either way so prefix matching does not need the file.
++    std::string path;
++    size_t size_disk = 0;
++
++    // the checkpoints stored in the file
++    std::vector<server_prompt_checkpoint_pos> checkpoints_disk;
++
++    // set while the file is still being written
++    std::shared_ptr<server_prompt_spill_job> job;
++
++    bool on_disk() const {
++        return !path.empty();
++    }
++
++    // resident cost only: a spilled state has empty vectors and no checkpoints
+     size_t size() const {
+         size_t res = data.size();
+ 
+@@ -615,6 +647,8 @@ struct server_prompt_cache {
+         this->limit_tokens = limit_tokens;
+     }
+ 
++    ~server_prompt_cache();
++
+     std::list<server_prompt_cache_state> states;
+ 
+     // in bytes, 0 = no limit
+@@ -623,8 +657,32 @@ struct server_prompt_cache {
+     // in tokens, 0 = no limit
+     size_t limit_tokens = 0;
+ 
++    // when set, states evicted for want of RAM are written here instead of being dropped
++    std::string dir;
++
++    // in bytes, 0 = no limit
++    size_t limit_size_disk = 0;
++
++    // identifies the model/context the spilled blobs belong to
++    uint64_t fingerprint = 0;
++
++    // whether the token lists may contain media chunks, needed to deserialize them
++    bool has_mtmd = false;
++
++    // whether a state that diverges from the new prompt before its end can only be resumed
++    // from a checkpoint (recurrent or SWA memory), and the SWA window when it applies
++    bool    needs_checkpoint = false;
++    int32_t n_swa            = 0;
++
++    // adopt the state files an earlier run left in `dir`, so the cache survives a restart.
++    // files belonging to another model or context, and unreadable ones, are deleted.
++    // returns how many entries were adopted.
++    size_t index_dir(const llama_context * ctx);
++
+     size_t size() const;
+ 
++    size_t size_disk() const;
++
+     size_t n_tokens() const;
+ 
+     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+@@ -632,6 +690,39 @@ struct server_prompt_cache {
+     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+ 
+     void update();
++
++    // write every resident state to `dir` and wait until all files are complete
++    void flush();
++
++private:
++    // hand a state's data to the writer thread. returns false if it cannot be written.
++    bool spill(server_prompt_cache_state & state);
++
++    // read a spilled state's data back. returns false if the file is unusable.
++    bool read_file(server_prompt_cache_state & state, server_prompt_data & data, std::list<common_prompt_checkpoint> & checkpoints);
++
++    // drop `it`, deleting its file if it has one
++    std::list<server_prompt_cache_state>::iterator drop(std::list<server_prompt_cache_state>::iterator it);
++
++    // evict spilled states, least recently used first, until the disk budget fits `need` more bytes
++    void make_room_disk(size_t need);
++
++    // how many tokens of `tokens_new` a state could keep without being decoded again
++    int n_reusable(const server_prompt_cache_state & state, const server_tokens & tokens_new) const;
++
++    // writer thread
++    void writer_loop();
++    void writer_start();
++    void writer_wait(const std::shared_ptr<server_prompt_spill_job> & job);
++
++    std::thread                                          writer;
++    std::mutex                                           writer_mutex;
++    std::condition_variable                              writer_cv;
++    std::condition_variable                              writer_cv_done;
++    std::deque<std::shared_ptr<server_prompt_spill_job>> writer_queue;
++    bool                                                 writer_stop = false;
++
++    size_t i_file = 0;
+ };
+ 
+ // used exclusively by router mode
