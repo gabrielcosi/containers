@@ -1,0 +1,110 @@
+---
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+name: Validate Pull Request
+
+on:
+  merge_group:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    outputs:
+      changed-files: ${{ steps.set-fallback.outputs.changed_files || steps.changed-files.outputs.changed_files }}
+    steps:
+      - name: Get changed files
+        uses: bjw-s-labs/action-changed-files@147be9638332cf68fd60714a610509d7a9360d60 # v0.7.0
+        id: changed-files
+        with:
+          path: apps
+          include_only_directories: true
+          max_depth: 1
+
+      - name: Set fallback for empty changes
+        id: set-fallback
+        if: ${{ steps.changed-files.outputs.changed_files == '[]' }}
+        run: echo 'changed_files=["__skip__"]' >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build and test
+    needs:
+      - prepare
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        app: ${{ fromJSON(needs.prepare.outputs.changed-files) }}
+      fail-fast: false
+      max-parallel: 2
+    env:
+      APP: ${{ matrix.app }}
+    steps:
+      - name: Free disk space
+        if: ${{ matrix.app != '__skip__' }}
+        run: |-
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+
+      - name: Checkout
+        if: ${{ matrix.app != '__skip__' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        if: ${{ matrix.app != '__skip__' }}
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Add include directory to build context
+        if: ${{ matrix.app != '__skip__' }}
+        run: rsync -a --ignore-existing ./include/ "./apps/${APP}/"
+
+      - name: Check for tests
+        id: tests
+        if: ${{ matrix.app != '__skip__' }}
+        run: |
+          if ls "apps/${APP}"/*_test.go >/dev/null 2>&1; then echo "present=true" >> "$GITHUB_OUTPUT"; else echo "present=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Build image
+        if: ${{ matrix.app != '__skip__' }}
+        uses: docker/bake-action@018cb6412ab401ebaa809aa5f85966b74628600f # v7.4.0
+        id: bake
+        with:
+          load: ${{ steps.tests.outputs.present == 'true' }}
+          push: false
+          files: ./docker-bake.hcl
+          source: ./apps/${{ matrix.app }}
+          targets: ${{ steps.tests.outputs.present == 'true' && 'image-local' || 'image-all' }}
+        env:
+          GIT_SHA: ${{ github.sha }}
+
+      - name: Set up Go
+        if: ${{ steps.tests.outputs.present == 'true' }}
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Run tests
+        if: ${{ steps.tests.outputs.present == 'true' }}
+        env:
+          TESTCONTAINERS_RYUK_DISABLED: "true"
+          TEST_IMAGE: ${{ steps.tests.outputs.present == 'true' && format('{0}@{1}', matrix.app, fromJSON(steps.bake.outputs.metadata)['image-local']['containerimage.digest']) || '' }}
+        run: go test -v "./apps/${APP}/..."
+
+  build-success:
+    needs:
+      - build
+    if: ${{ !cancelled() }}
+    name: Build and test - Success
+    runs-on: ubuntu-latest
+    steps:
+      - name: Any jobs failed?
+        if: ${{ contains(needs.*.result, 'failure') }}
+        run: exit 1
+
+      - name: All jobs passed or skipped?
+        if: ${{ !contains(needs.*.result, 'failure') }}
+        run: echo "All jobs passed or skipped"

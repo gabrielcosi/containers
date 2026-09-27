@@ -1,0 +1,23 @@
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index a85155360..a03d25faf 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1,3 +1,4 @@
++#include <cstdlib>
+ #include "mmvq.cuh"
+ #include "quantize.cuh"
+ #include "unary.cuh"
+@@ -319,6 +320,13 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
+     if (!ggml_is_quantized(type)) {
+         return false;
+     }
++    {
++        // runtime override of the MMVQ/MMQ batch-size crossover: GGML_CUDA_MMVQ_MAX=<n> (all quant types), GGML_CUDA_MMVQ_MAX_NVFP4=<n>
++        static const int ov_all = [] { const char * e = getenv("GGML_CUDA_MMVQ_MAX"); return e ? atoi(e) : -1; }();
++        static const int ov_fp4 = [] { const char * e = getenv("GGML_CUDA_MMVQ_MAX_NVFP4"); return e ? atoi(e) : -1; }();
++        if (type == GGML_TYPE_NVFP4 && ov_fp4 >= 0) { return ne11 <= ov_fp4; }
++        if (ov_all >= 0) { return ne11 <= ov_all; }
++    }
+     // k-quants cost more to decode and mvq redoes that per column, so MMQ wins sooner.
+     // Only list quant-types MMQ supports, others would fall back to cuBLAS.
+     if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_ADA_LOVELACE) {
