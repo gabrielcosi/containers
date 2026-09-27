@@ -1,5 +1,5 @@
 # CUDA major.minor must match the CUDA runtime in the llama-swap image that runs this binary
-FROM docker.io/nvidia/cuda:13.3.1-devel-ubuntu24.04 AS build
+FROM docker.io/nvidia/cuda:13.4.1-devel-ubuntu24.04 AS build
 
 ARG VERSION
 
