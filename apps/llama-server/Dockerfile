@@ -1,4 +1,4 @@
-FROM docker.io/nvidia/cuda:13.3.1-devel-ubuntu24.04 AS build
+FROM docker.io/nvidia/cuda:13.4.1-devel-ubuntu24.04 AS build
 
 ARG VERSION
 
