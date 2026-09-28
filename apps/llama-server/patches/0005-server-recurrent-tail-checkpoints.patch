@@ -1,0 +1,547 @@
+diff --git a/common/common.cpp b/common/common.cpp
+index ae44f054a..4aca60ad7 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -10,6 +10,8 @@
+ #include "speculative.h"
+ #include "unicode.h"
+ 
++#include "../src/llama-ext.h" // staging API: llama_state_seq_get_data_at
++
+ #include <algorithm>
+ #include <cinttypes>
+ #include <climits>
+@@ -2273,6 +2275,26 @@ void common_prompt_checkpoint::update_tgt(
+     }
+ }
+ 
++bool common_prompt_checkpoint::update_tgt_at(
++        llama_context * ctx,
++        llama_seq_id seq_id,
++        llama_pos pos_max) {
++    const size_t ckpt_size = llama_state_seq_get_data_at(ctx, nullptr, 0, seq_id, pos_max);
++    if (ckpt_size == 0) {
++        return false;
++    }
++
++    data_tgt.resize(ckpt_size);
++
++    const size_t n = llama_state_seq_get_data_at(ctx, data_tgt.data(), ckpt_size, seq_id, pos_max);
++    if (n != ckpt_size) {
++        data_tgt.clear();
++        return false;
++    }
++
++    return true;
++}
++
+ void common_prompt_checkpoint::update_dft(
+         llama_context * ctx,
+         llama_seq_id seq_id,
+diff --git a/common/common.h b/common/common.h
+index 716aff2af..e0add89ee 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -1212,6 +1212,13 @@ struct common_prompt_checkpoint {
+             llama_seq_id seq_id,
+             llama_state_seq_flags flags);
+ 
++    // PARTIAL_ONLY state as of pos_max, taken after later tokens were decoded
++    // returns false if the target no longer holds that state (see llama_state_seq_get_data_at)
++    bool update_tgt_at(
++            llama_context * ctx,
++            llama_seq_id seq_id,
++            llama_pos pos_max);
++
+     void update_dft(
+             llama_context * ctx,
+             llama_seq_id seq_id,
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 99e55da68..6a73692b8 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -7,6 +7,8 @@
+ #include "llama-batch.h"
+ #include "llama-io.h"
+ #include "llama-memory.h"
++#include "llama-memory-hybrid.h"
++#include "llama-memory-recurrent.h"
+ #include "llama-mmap.h"
+ #include "llama-model.h"
+ #include "llama-ext.h"
+@@ -19,6 +21,7 @@
+ #include <limits>
+ #include <stdexcept>
+ #include <string>
++#include <typeinfo>
+ #include <unordered_map>
+ 
+ //
+@@ -4294,6 +4297,47 @@ size_t llama_state_seq_get_data_ext(llama_context * ctx, uint8_t * dst, size_t s
+ 
+     return ctx->state_seq_get_data(seq_id, dst, size, flags);
+ }
++// the recurrent memory that holds the whole PARTIAL_ONLY state of ctx, nullptr for any other memory layout
++// exact type match: subclasses (e.g. llama_memory_hybrid_idx) may write more than mem_recr under PARTIAL_ONLY
++static llama_memory_recurrent * llama_state_at_mem(llama_context * ctx) {
++    llama_memory_i * mem = ctx->get_memory();
++    if (mem == nullptr) {
++        return nullptr;
++    }
++
++    llama_memory_recurrent * mem_recr = nullptr;
++    if (typeid(*mem) == typeid(llama_memory_recurrent)) {
++        mem_recr = static_cast<llama_memory_recurrent *>(mem);
++    } else if (typeid(*mem) == typeid(llama_memory_hybrid)) {
++        mem_recr = static_cast<llama_memory_hybrid *>(mem)->get_mem_recr();
++    }
++
++    return mem_recr && mem_recr->n_rs_seq > 0 ? mem_recr : nullptr;
++}
++
++bool llama_state_seq_can_get_at(llama_context * ctx) {
++    return llama_state_at_mem(ctx) != nullptr;
++}
++
++size_t llama_state_seq_get_data_at(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_pos pos_max) {
++    llama_memory_recurrent * mem = llama_state_at_mem(ctx);
++    if (mem == nullptr || !mem->state_at_begin(seq_id, pos_max)) {
++        return 0;
++    }
++
++    size_t res;
++    if (dst == nullptr) {
++        res = ctx->state_seq_get_size(seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++    } else {
++        ctx->synchronize();
++        res = ctx->state_seq_get_data(seq_id, dst, size, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++    }
++
++    mem->state_at_end();
++
++    return res;
++}
++
+ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
+     ctx->synchronize();
+ 
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+index 92a759b7a..ce5ec3521 100644
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -116,6 +116,26 @@ LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uin
+ 
+ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
+ 
++//
++// partial state as of an earlier position [TAG_RECURRENT_STATE_AT]
++//
++
++// true if the memory of ctx can write its LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY state as of a position inside the last
++// ubatch (recurrent or hybrid memory with n_rs_seq > 0)
++LLAMA_API bool llama_state_seq_can_get_at(struct llama_context * ctx);
++
++// write the LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY state of seq_id as it was right after the token at pos_max, without
++// changing the live state. the result is the same as llama_state_seq_get_data_ext() called at that point
++// dst == nullptr: return the required size
++// returns 0 if the memory does not hold that state anymore (pos_max must be among the last n_rs_seq tokens of the
++// last ubatch of seq_id, with nothing changed since)
++LLAMA_API size_t llama_state_seq_get_data_at(
++        struct llama_context * ctx,
++                     uint8_t * dst,
++                      size_t   size,
++                llama_seq_id   seq_id,
++                   llama_pos   pos_max);
++
+ //
+ // model/context data extraction
+ //
+diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
+index 528c90c41..1fac6328b 100644
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -34,6 +34,7 @@ llama_memory_recurrent::llama_memory_recurrent(
+ 
+     this->n_rs_seq = n_rs_seq;
+     rs_idx.assign(n_seq_max, 0);
++    rs_last.assign(n_seq_max, {});
+ 
+     cells.clear();
+     cells.resize(mem_size);
+@@ -417,6 +418,59 @@ void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
+     rs_idx[seq_id] = idx;
+ }
+ 
++void llama_memory_recurrent::rs_record(const llama_ubatch & ubatch) {
++    if (n_rs_seq == 0) {
++        return;
++    }
++
++    for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
++        const uint32_t i = s*ubatch.n_seq_tokens;
++
++        for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
++            const llama_seq_id seq_id = ubatch.seq_id[i][j];
++            const int32_t      tail   = cells[seq_id].tail;
++
++            rs_last[seq_id] = { tail, tail >= 0 ? cells[tail].pos : -1, ubatch.n_seq_tokens };
++        }
++    }
++}
++
++bool llama_memory_recurrent::state_at_begin(llama_seq_id seq_id, llama_pos pos_max) {
++    // non-causal graphs write only plane 0 (see lfm2.cpp), so there is nothing to read from the other planes
++    if (!hparams.causal_attn || seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
++        return false;
++    }
++
++    const int32_t tail = cells[seq_id].tail;
++    if (tail < 0) {
++        return false;
++    }
++
++    const auto & cell = cells[tail];
++    const auto & last = rs_last[seq_id];
++
++    // the planes are valid only while the cell still holds the output of the last ubatch of this seq:
++    //   not moved, not rolled back, not shared and without a pending rollback
++    if (last.tail != tail || last.pos != cell.pos || cell.src != tail || cell.seq_id.size() != 1 || rs_idx[seq_id] != 0) {
++        return false;
++    }
++
++    // plane k holds the state k tokens back, written only for k < min(n_seq_tokens, 1 + n_rs_seq)
++    const llama_pos k = cell.pos - pos_max;
++    if (k < 0 || k >= (llama_pos) std::min(last.n_seq_tokens, n_rs_seq + 1)) {
++        return false;
++    }
++
++    state_at_seq = seq_id;
++    state_at_k   = (uint32_t) k;
++
++    return true;
++}
++
++void llama_memory_recurrent::state_at_end() {
++    state_at_seq = -1;
++}
++
+ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
+     std::map<ggml_backend_buffer_type_t, size_t> ret;
+     for (const auto & [_, buf] : ctxs_bufs) {
+@@ -484,6 +538,7 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
+     auto org_cells = cells;
+     auto org_used = used;
+     auto org_head = head;
++    auto org_rs_last = rs_last;
+ 
+     bool success = true;
+ 
+@@ -498,6 +553,7 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
+     cells = std::move(org_cells);
+     used = org_used;
+     head = org_head;
++    rs_last = std::move(org_rs_last);
+ 
+     return success;
+ }
+@@ -644,6 +700,12 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
+                     tail = dst_id;
+                 } else if (tail == dst_id) {
+                     tail = src_id;
++                } else {
++                    continue;
++                }
++                // a moved state leaves its snapshots behind [TAG_RECURRENT_STATE_AT]
++                if (j < rs_last.size()) {
++                    rs_last[j] = {};
+                 }
+             }
+         }
+@@ -783,7 +845,7 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
+             if (n_rs_seq != 0) {
+                 if (seq_id != -1) {
+                     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < rs_idx.size());
+-                    rs_idx_cur = rs_idx[seq_id];
++                    rs_idx_cur = seq_id == state_at_seq ? state_at_k : rs_idx[seq_id];
+                 } else {
+                     bool has_rs_idx = false;
+                     for (const llama_seq_id cell_seq_id : cell.seq_id) {
+@@ -872,6 +934,13 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
+ 
+     if (n_rs_seq != 0) {
+         set_rs_idx(seq_id, 0);
++
++        // a restored state carries no snapshots [TAG_RECURRENT_STATE_AT]
++        if (seq_id < 0) {
++            std::fill(rs_last.begin(), rs_last.end(), rs_ubatch_info{});
++        } else {
++            rs_last[seq_id] = {};
++        }
+     }
+ }
+ 
+@@ -879,7 +948,8 @@ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::
+     for (const auto & range : cell_ranges) {
+         for (uint32_t i = range.first; i < range.second; ++i) {
+             const auto & cell = cells[i];
+-            const llama_pos pos      = cell.pos;
++            // the state written from a snapshot plane is k tokens behind the cell [TAG_RECURRENT_STATE_AT]
++            const llama_pos pos      = cell.pos - (seq_id != -1 && seq_id == state_at_seq ? (llama_pos) state_at_k : 0);
+             const uint32_t  n_seq_id = seq_id == -1 ? cell.seq_id.size() : 0;
+ 
+             io.write(&pos,      sizeof(pos));
+@@ -1301,6 +1371,7 @@ bool llama_memory_recurrent_context::apply() {
+     }
+ 
+     mem->find_slot(ubatches[i_next]);
++    mem->rs_record(ubatches[i_next]);
+ 
+     return true;
+ }
+diff --git a/src/llama-memory-recurrent.h b/src/llama-memory-recurrent.h
+index 25ade10e5..a31e3c2fd 100644
+--- a/src/llama-memory-recurrent.h
++++ b/src/llama-memory-recurrent.h
+@@ -78,6 +78,24 @@ public:
+ 
+     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
+ 
++    // [TAG_RECURRENT_STATE_AT]
++    // the snapshots written by the last ubatch applied for each seq: the tail cell, its pos and the number of tokens of
++    //   the seq in that ubatch. the snapshot planes hold the states after the last min(n_seq_tokens, 1 + n_rs_seq) tokens
++    struct rs_ubatch_info {
++        int32_t   tail         = -1;
++        llama_pos pos          = -1;
++        uint32_t  n_seq_tokens = 0;
++    };
++
++    std::vector<rs_ubatch_info> rs_last;
++
++    void rs_record(const llama_ubatch & ubatch);
++
++    // make the next state_write() of seq_id write its state as of pos_max, read from the snapshot planes
++    // returns false if the snapshots do not hold that state
++    bool state_at_begin(llama_seq_id seq_id, llama_pos pos_max);
++    void state_at_end();
++
+     // computed before each graph build
+     uint32_t n = 0;
+ 
+@@ -120,6 +138,10 @@ private:
+ 
+     const uint32_t n_seq_max = 1;
+ 
++    // set by state_at_begin(): the seq and the snapshot plane to write instead of the live state
++    llama_seq_id state_at_seq = -1;
++    uint32_t     state_at_k   = 0;
++
+     // ggml contexts for the KV cache along with the allocated backend buffers:
+     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+ 
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 4b05da67d..afa777db1 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -11,6 +11,7 @@
+ #include "common.h"
+ #include "fit.h"
+ #include "llama.h"
++#include "../src/llama-ext.h" // staging API: llama_state_seq_can_get_at
+ #include "log.h"
+ #include "sampling.h"
+ #include "speculative.h"
+@@ -299,6 +300,10 @@ struct server_slot {
+     // n_tokens of the context checkpoint restored for the current task, -1 if none
+     int64_t n_tokens_ckpt_restored = -1;
+ 
++    // tail context checkpoint deferred until the prompt tail is decoded, -1 if none [TAG_RECURRENT_STATE_AT]
++    int64_t   ckpt_at_n_tokens = -1;
++    llama_pos ckpt_at_pos_max  = -1;
++
+     // move_checkpoints: move the checkpoints into the cache instead of copying them, when the prompt is discarded next
+     server_prompt_cache_state * prompt_save(server_prompt_cache & prompt_cache, bool move_checkpoints = false) {
+         if (prompt.tokens.size() == 0) {
+@@ -935,6 +940,9 @@ private:
+ 
+     common_speculative_ptr spec;
+ 
++    // the tail context checkpoint can be taken from the recurrent snapshots after decoding the tail [TAG_RECURRENT_STATE_AT]
++    bool ckpt_at_ok = false;
++
+     bool add_bos_token = true;
+ 
+     int32_t n_ctx; // total context for all clients / slots
+@@ -1319,6 +1327,19 @@ private:
+             model_dft = nullptr;
+         }
+ 
++        // [TAG_RECURRENT_STATE_AT]
++        // the draft state is taken as-is after the decode, so it must be a plain attention cache that seq_rm trims on restore
++        // EAGLE3 stashes a per-position speculative state with the checkpoints (common_speculative_get_state), which
++        //   would be taken at the end of the tail - any other implementation doing so must be excluded here too
++        const bool spec_eagle3 = std::find(params_base.speculative.types.begin(),
++                                           params_base.speculative.types.end(),
++                                           COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) != params_base.speculative.types.end();
++        ckpt_at_ok = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && llama_state_seq_can_get_at(ctx_tgt) &&
++            (ctx_dft == nullptr ||
++                (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART && llama_model_n_swa(llama_get_model(ctx_dft)) == 0)) &&
++            !(spec && spec_eagle3);
++        SRV_TRC("tail context checkpoints from recurrent snapshots: %s\n", ckpt_at_ok ? "yes" : "no");
++
+         if (!spec && params_base.speculative.has_synth()) {
+             SRV_ERR("%s", "synthetic acceptance requires an initialized speculative decoding context\n");
+             return false;
+@@ -2441,14 +2462,22 @@ private:
+     }
+ 
+     // n_tokens_cur: the number of tokens added to the batch for the current slot
+-    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
++    // from_snapshots: the state is read after later tokens were decoded, from the recurrent snapshots [TAG_RECURRENT_STATE_AT]
++    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max, bool from_snapshots = false) {
+         const int id_task = slot.task->id;
+ 
+         // the checkpoint restored for this task holds the current state if nothing was decoded since
+         const int64_t n_tokens_restored = slot.n_tokens_ckpt_restored;
+         slot.n_tokens_ckpt_restored = -1;
+ 
+-        if (n_tokens_restored == slot.prompt.n_tokens() - n_tokens_cur) {
++        // the target state from the snapshots may be unavailable, read it before touching the list
++        common_prompt_checkpoint ckpt_at;
++        if (from_snapshots && !ckpt_at.update_tgt_at(ctx_tgt, slot.id, pos_max)) {
++            SLT_WRN(slot, "derived context checkpoint unavailable, dropped (n_tokens = %" PRId64 ", pos_max = %d)\n", slot.prompt.n_tokens() - n_tokens_cur, pos_max);
++            return;
++        }
++
++        if (!from_snapshots && n_tokens_restored == slot.prompt.n_tokens() - n_tokens_cur) {
+             for (auto & ckpt : slot.prompt.checkpoints) {
+                 if (ckpt.n_tokens == n_tokens_restored && ckpt.pos_min == pos_min && ckpt.pos_max == pos_max) {
+                     SLT_TRC(slot, "reusing restored context checkpoint at n_tokens = %" PRId64 "\n", ckpt.n_tokens);
+@@ -2509,17 +2538,46 @@ private:
+         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
+         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
+ 
+-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++        if (from_snapshots) {
++            cur.data_tgt = std::move(ckpt_at.data_tgt);
++        } else {
++            cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++        }
++        // with from_snapshots, the draft KV also holds the tail, which seq_rm trims on restore
+         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+         // stash the draft's speculative state with the checkpoint
+         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+ 
+         SLT_TRC(slot,
+-                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+-                (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
++                "created %scontext checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
++                from_snapshots ? "derived " : "", (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
+                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+     }
+ 
++    // [TAG_RECURRENT_STATE_AT]
++    // take the deferred tail checkpoints of the slots whose prompt ends in the decoded sub-batch
++    // must run before anything decodes again or copies the slot state
++    void create_checkpoints_at(int32_t off, int32_t n_tokens) {
++        for (auto & slot : slots) {
++            if (slot.ckpt_at_n_tokens < 0 || slot.i_batch < off || slot.i_batch >= off + n_tokens) {
++                continue;
++            }
++
++            const int64_t   n_tokens_ckpt = slot.ckpt_at_n_tokens;
++            const llama_pos pos_max       = slot.ckpt_at_pos_max;
++
++            slot.ckpt_at_n_tokens = -1;
++            slot.ckpt_at_pos_max  = -1;
++
++            if (!slot.is_processing()) {
++                continue;
++            }
++
++            // same as a checkpoint created before decoding the tail: the recurrent state is valid only at pos_max
++            create_checkpoint(slot, slot.prompt.n_tokens() - n_tokens_ckpt, pos_max, pos_max, true);
++        }
++    }
++
+     // returns false to decline the task, it is offered again after the decode is done
+     bool process_single_task(server_task && task, bool is_yielding) {
+         // while yielding, an encode / decode is running and only reading the server state is safe
+@@ -3314,6 +3372,9 @@ private:
+ 
+                         slot.n_tokens_ckpt_restored = -1;
+ 
++                        slot.ckpt_at_n_tokens = -1;
++                        slot.ckpt_at_pos_max  = -1;
++
+                         // empty prompt passed -> release the slot and send empty response
+                         if (input_tokens.empty()) {
+                             SLT_WRN(slot, "%s", "empty prompt - releasing slot\n");
+@@ -3672,6 +3733,29 @@ private:
+                     const auto & spans = slot.task->params.message_spans;
+                     const auto last_user_pos = spans.last_user_message_pos();
+ 
++                    // the first prompt token of the slot in this batch
++                    const auto n_tokens_begin = slot.prompt.n_tokens();
++
++                    // [TAG_RECURRENT_STATE_AT]
++                    // the last n_last tokens can be decoded together with the rest of the prompt and the checkpoint before
++                    // them taken afterwards from the recurrent snapshots, if they end the prompt in this batch
++                    auto can_ckpt_at = [&](int n_last) {
++                        const auto p = slot.prompt.n_tokens();
++
++                        if (!ckpt_at_ok || n_last > (int) llama_n_rs_seq(ctx_tgt) || p <= n_tokens_begin ||
++                            batch.size() + n_last > n_batch || alora_scale > 0.0f) {
++                            return false;
++                        }
++
++                        for (int i = p; i < slot.task->n_tokens(); ++i) {
++                            if (input_tokens[i] == LLAMA_TOKEN_NULL || spans.is_user_start(i + 1)) {
++                                return false;
++                            }
++                        }
++
++                        return true;
++                    };
++
+                     // add prompt tokens for processing in the current batch
+                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                         // get next token to process
+@@ -3721,6 +3805,14 @@ private:
+                                 const int n_last = std::min(n_batch, offset);
+                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
+                                     should_break = true;
++
++                                    // [TAG_RECURRENT_STATE_AT] only the tail checkpoint
++                                    if (offset == checkpoint_offsets[1] && can_ckpt_at(n_last)) {
++                                        should_break = false;
++
++                                        slot.ckpt_at_n_tokens = slot.prompt.n_tokens();
++                                        slot.ckpt_at_pos_max  = slot.prompt.tokens.pos_next() - 1;
++                                    }
+                                     break;
+                                 }
+                             }
+@@ -3730,6 +3822,13 @@ private:
+                         }
+                     }
+ 
++                    // the deferred tail checkpoint needs the rest of the prompt in this batch
++                    if (slot.ckpt_at_n_tokens >= 0 && slot.prompt.n_tokens() != slot.task->n_tokens()) {
++                        SLT_WRN(slot, "derived context checkpoint unavailable, dropped (n_tokens = %" PRId64 ", prompt tail not in the batch)\n", slot.ckpt_at_n_tokens);
++                        slot.ckpt_at_n_tokens = -1;
++                        slot.ckpt_at_pos_max  = -1;
++                    }
++
+                     // the number of tokens added to the batch for the current slot
+                     const auto n_tokens_cur = batch.size() - n_tokens_prev;
+ 
+@@ -3907,6 +4006,9 @@ private:
+             }
+         }
+ 
++        // before the child slots copy the prompt checkpoints
++        create_checkpoints_at(off, batch_view.n_tokens);
++
+         // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
+         for (auto & slot : slots) {
+             if (slot.state == SLOT_STATE_DONE_PROMPT && slot.task->is_parent()) {
