@@ -4,7 +4,7 @@ SOURCE = "https://github.com/ggml-org/llama.cpp"
 variable "GIT_SHA" {}
 
 variable "VERSION" {
-  // renovate: datasource=github-releases depName=ggml-org/llama.cpp versioning=regex:^b(?<major>\d+)$
+  // renovate: datasource=github-releases depName=ggml-org/llama.cpp versioning=regex:^b(?<patch>\d+)$
   default = "b11206"
 }
 

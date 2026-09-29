@@ -49,8 +49,9 @@
       addLabels: ["major-update"],
     },
     {
-      description: ["llama.cpp tags several releases a day; rebuild at most once a day"],
+      description: ["llama.cpp marks every release as a prerelease and tags several a day; rebuild at most once a day"],
       matchDepNames: ["ggml-org/llama.cpp"],
+      ignoreUnstable: false,
       schedule: ["* 2-5 * * *"],
     },
   ],
