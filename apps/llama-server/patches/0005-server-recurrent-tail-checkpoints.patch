@@ -540,7 +540,7 @@ index 4b05da67d..afa777db1 100644
          }
  
 +        // before the child slots copy the prompt checkpoints
-+        create_checkpoints_at(off, batch_view.n_tokens);
++        create_checkpoints_at(off, batch.view.size());
 +
          // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
          for (auto & slot : slots) {
