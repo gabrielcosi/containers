@@ -2,7 +2,7 @@ diff --git a/common/arg.cpp b/common/arg.cpp
 index 63e342776..78c9b0756 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
-@@ -1717,6 +1717,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -1717,6 +1717,29 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              params.cache_ram_mib = value;
          }
      ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
@@ -12,8 +12,12 @@ index 63e342776..78c9b0756 100644
 +        "from here is much cheaper than decoding the prompt again. created if missing. must not be shared with "
 +        "another server: state files it cannot use are deleted at startup (default: disabled)",
 +        [](common_params & params, const std::string & value) {
-+            if (!value.empty() && (!fs_create_directory_with_parents(value) || !fs_is_directory(value))) {
-+                throw std::invalid_argument("cannot create directory: " + value);
++            if (!value.empty()) {
++                std::error_code ec;
++                std::filesystem::create_directories(value, ec);
++                if (ec || !fs_is_directory(value)) {
++                    throw std::invalid_argument("cannot create directory: " + value);
++                }
 +            }
 +            params.cache_dir = value;
 +        }
