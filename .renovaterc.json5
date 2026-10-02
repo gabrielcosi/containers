@@ -52,7 +52,7 @@
       description: ["llama.cpp marks every release as a prerelease and tags several a day; rebuild at most once a day"],
       matchDepNames: ["ggml-org/llama.cpp"],
       ignoreUnstable: false,
-      schedule: ["* 2-5 * * *"],
+      schedule: ["* 0-6 * * *"],
     },
   ],
 }
