@@ -1,8 +1,8 @@
 diff --git a/common/common.cpp b/common/common.cpp
-index ae44f054a..4aca60ad7 100644
+index 0269bc895..5cb8ba0be 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
-@@ -10,6 +10,8 @@
+@@ -13,6 +13,8 @@
  #include "speculative.h"
  #include "unicode.h"
  
@@ -11,7 +11,7 @@ index ae44f054a..4aca60ad7 100644
  #include <algorithm>
  #include <cinttypes>
  #include <climits>
-@@ -2273,6 +2275,26 @@ void common_prompt_checkpoint::update_tgt(
+@@ -2342,6 +2344,26 @@ void common_prompt_checkpoint::update_tgt(
      }
  }
  
@@ -39,10 +39,10 @@ index ae44f054a..4aca60ad7 100644
          llama_context * ctx,
          llama_seq_id seq_id,
 diff --git a/common/common.h b/common/common.h
-index 716aff2af..e0add89ee 100644
+index 063779248..51ee2acbe 100644
 --- a/common/common.h
 +++ b/common/common.h
-@@ -1212,6 +1212,13 @@ struct common_prompt_checkpoint {
+@@ -1285,6 +1285,13 @@ struct common_prompt_checkpoint {
              llama_seq_id seq_id,
              llama_state_seq_flags flags);
  
@@ -57,7 +57,7 @@ index 716aff2af..e0add89ee 100644
              llama_context * ctx,
              llama_seq_id seq_id,
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 99e55da68..6a73692b8 100644
+index 96b5464e6..1c7060875 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -7,6 +7,8 @@
@@ -77,7 +77,7 @@ index 99e55da68..6a73692b8 100644
  #include <unordered_map>
  
  //
-@@ -4294,6 +4297,47 @@ size_t llama_state_seq_get_data_ext(llama_context * ctx, uint8_t * dst, size_t s
+@@ -4346,6 +4349,47 @@ size_t llama_state_seq_get_data_ext(llama_context * ctx, uint8_t * dst, size_t s
  
      return ctx->state_seq_get_data(seq_id, dst, size, flags);
  }
@@ -126,10 +126,10 @@ index 99e55da68..6a73692b8 100644
      ctx->synchronize();
  
 diff --git a/src/llama-ext.h b/src/llama-ext.h
-index 92a759b7a..ce5ec3521 100644
+index fcc78f47e..235297208 100644
 --- a/src/llama-ext.h
 +++ b/src/llama-ext.h
-@@ -116,6 +116,26 @@ LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uin
+@@ -130,6 +130,26 @@ LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uin
  
  LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
  
@@ -157,7 +157,7 @@ index 92a759b7a..ce5ec3521 100644
  // model/context data extraction
  //
 diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
-index 528c90c41..1fac6328b 100644
+index 53130e868..9821b9d10 100644
 --- a/src/llama-memory-recurrent.cpp
 +++ b/src/llama-memory-recurrent.cpp
 @@ -34,6 +34,7 @@ llama_memory_recurrent::llama_memory_recurrent(
@@ -168,7 +168,7 @@ index 528c90c41..1fac6328b 100644
  
      cells.clear();
      cells.resize(mem_size);
-@@ -417,6 +418,59 @@ void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
+@@ -429,6 +430,59 @@ void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
      rs_idx[seq_id] = idx;
  }
  
@@ -228,7 +228,7 @@ index 528c90c41..1fac6328b 100644
  std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
      std::map<ggml_backend_buffer_type_t, size_t> ret;
      for (const auto & [_, buf] : ctxs_bufs) {
-@@ -484,6 +538,7 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
+@@ -496,6 +550,7 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
      auto org_cells = cells;
      auto org_used = used;
      auto org_head = head;
@@ -236,7 +236,7 @@ index 528c90c41..1fac6328b 100644
  
      bool success = true;
  
-@@ -498,6 +553,7 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
+@@ -510,6 +565,7 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
      cells = std::move(org_cells);
      used = org_used;
      head = org_head;
@@ -244,7 +244,7 @@ index 528c90c41..1fac6328b 100644
  
      return success;
  }
-@@ -644,6 +700,12 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
+@@ -656,6 +712,12 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                      tail = dst_id;
                  } else if (tail == dst_id) {
                      tail = src_id;
@@ -257,7 +257,7 @@ index 528c90c41..1fac6328b 100644
                  }
              }
          }
-@@ -783,7 +845,7 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
+@@ -801,7 +863,7 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
              if (n_rs_seq != 0) {
                  if (seq_id != -1) {
                      GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < rs_idx.size());
@@ -266,7 +266,7 @@ index 528c90c41..1fac6328b 100644
                  } else {
                      bool has_rs_idx = false;
                      for (const llama_seq_id cell_seq_id : cell.seq_id) {
-@@ -872,6 +934,13 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
+@@ -890,6 +952,13 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
  
      if (n_rs_seq != 0) {
          set_rs_idx(seq_id, 0);
@@ -280,7 +280,7 @@ index 528c90c41..1fac6328b 100644
      }
  }
  
-@@ -879,7 +948,8 @@ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::
+@@ -897,7 +966,8 @@ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::
      for (const auto & range : cell_ranges) {
          for (uint32_t i = range.first; i < range.second; ++i) {
              const auto & cell = cells[i];
@@ -290,7 +290,7 @@ index 528c90c41..1fac6328b 100644
              const uint32_t  n_seq_id = seq_id == -1 ? cell.seq_id.size() : 0;
  
              io.write(&pos,      sizeof(pos));
-@@ -1301,6 +1371,7 @@ bool llama_memory_recurrent_context::apply() {
+@@ -1319,6 +1389,7 @@ bool llama_memory_recurrent_context::apply() {
      }
  
      mem->find_slot(ubatches[i_next]);
@@ -299,7 +299,7 @@ index 528c90c41..1fac6328b 100644
      return true;
  }
 diff --git a/src/llama-memory-recurrent.h b/src/llama-memory-recurrent.h
-index 25ade10e5..a31e3c2fd 100644
+index 08489a4be..a51e3fb97 100644
 --- a/src/llama-memory-recurrent.h
 +++ b/src/llama-memory-recurrent.h
 @@ -78,6 +78,24 @@ public:
@@ -339,10 +339,10 @@ index 25ade10e5..a31e3c2fd 100644
      std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
  
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 4b05da67d..afa777db1 100644
+index 4ae1640ee..275b51850 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -11,6 +11,7 @@
+@@ -12,6 +12,7 @@
  #include "common.h"
  #include "fit.h"
  #include "llama.h"
@@ -350,7 +350,7 @@ index 4b05da67d..afa777db1 100644
  #include "log.h"
  #include "sampling.h"
  #include "speculative.h"
-@@ -299,6 +300,10 @@ struct server_slot {
+@@ -294,6 +295,10 @@ struct server_slot {
      // n_tokens of the context checkpoint restored for the current task, -1 if none
      int64_t n_tokens_ckpt_restored = -1;
  
@@ -361,7 +361,7 @@ index 4b05da67d..afa777db1 100644
      // move_checkpoints: move the checkpoints into the cache instead of copying them, when the prompt is discarded next
      server_prompt_cache_state * prompt_save(server_prompt_cache & prompt_cache, bool move_checkpoints = false) {
          if (prompt.tokens.size() == 0) {
-@@ -935,6 +940,9 @@ private:
+@@ -976,6 +981,9 @@ private:
  
      common_speculative_ptr spec;
  
@@ -371,7 +371,7 @@ index 4b05da67d..afa777db1 100644
      bool add_bos_token = true;
  
      int32_t n_ctx; // total context for all clients / slots
-@@ -1319,6 +1327,19 @@ private:
+@@ -1386,6 +1394,19 @@ private:
              model_dft = nullptr;
          }
  
@@ -391,7 +391,7 @@ index 4b05da67d..afa777db1 100644
          if (!spec && params_base.speculative.has_synth()) {
              SRV_ERR("%s", "synthetic acceptance requires an initialized speculative decoding context\n");
              return false;
-@@ -2441,14 +2462,22 @@ private:
+@@ -2579,14 +2600,22 @@ private:
      }
  
      // n_tokens_cur: the number of tokens added to the batch for the current slot
@@ -416,7 +416,7 @@ index 4b05da67d..afa777db1 100644
              for (auto & ckpt : slot.prompt.checkpoints) {
                  if (ckpt.n_tokens == n_tokens_restored && ckpt.pos_min == pos_min && ckpt.pos_max == pos_max) {
                      SLT_TRC(slot, "reusing restored context checkpoint at n_tokens = %" PRId64 "\n", ckpt.n_tokens);
-@@ -2509,17 +2538,46 @@ private:
+@@ -2647,17 +2676,46 @@ private:
          //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
          cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
  
@@ -466,7 +466,7 @@ index 4b05da67d..afa777db1 100644
      // returns false to decline the task, it is offered again after the decode is done
      bool process_single_task(server_task && task, bool is_yielding) {
          // while yielding, an encode / decode is running and only reading the server state is safe
-@@ -3314,6 +3372,9 @@ private:
+@@ -3459,6 +3517,9 @@ private:
  
                          slot.n_tokens_ckpt_restored = -1;
  
@@ -476,9 +476,9 @@ index 4b05da67d..afa777db1 100644
                          // empty prompt passed -> release the slot and send empty response
                          if (input_tokens.empty()) {
                              SLT_WRN(slot, "%s", "empty prompt - releasing slot\n");
-@@ -3672,6 +3733,29 @@ private:
-                     const auto & spans = slot.task->params.message_spans;
-                     const auto last_user_pos = spans.last_user_message_pos();
+@@ -3856,6 +3917,29 @@ private:
+ 
+                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
  
 +                    // the first prompt token of the slot in this batch
 +                    const auto n_tokens_begin = slot.prompt.n_tokens();
@@ -506,7 +506,7 @@ index 4b05da67d..afa777db1 100644
                      // add prompt tokens for processing in the current batch
                      while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
                          // get next token to process
-@@ -3721,6 +3805,14 @@ private:
+@@ -3918,6 +4002,14 @@ private:
                                  const int n_last = std::min(n_batch, offset);
                                  if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
                                      should_break = true;
@@ -521,7 +521,7 @@ index 4b05da67d..afa777db1 100644
                                      break;
                                  }
                              }
-@@ -3730,6 +3822,13 @@ private:
+@@ -3927,6 +4019,13 @@ private:
                          }
                      }
  
@@ -535,7 +535,7 @@ index 4b05da67d..afa777db1 100644
                      // the number of tokens added to the batch for the current slot
                      const auto n_tokens_cur = batch.size() - n_tokens_prev;
  
-@@ -3907,6 +4006,9 @@ private:
+@@ -4104,6 +4203,9 @@ private:
              }
          }
  
