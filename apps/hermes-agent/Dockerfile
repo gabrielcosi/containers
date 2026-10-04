@@ -2,7 +2,7 @@ ARG VERSION
 FROM docker.io/nousresearch/hermes-agent:${VERSION}
 
 # renovate: datasource=github-tags depName=eleboucher/memini
-ARG MEMINI_VERSION=0.7.33
+ARG MEMINI_VERSION=0.7.34
 
 USER root:root
 
