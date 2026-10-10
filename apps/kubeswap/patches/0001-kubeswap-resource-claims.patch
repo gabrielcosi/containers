@@ -1,0 +1,507 @@
+diff --git a/cmd/kubeswap/README.md b/cmd/kubeswap/README.md
+index 394dc60..4d9bdfb 100644
+--- a/cmd/kubeswap/README.md
++++ b/cmd/kubeswap/README.md
+@@ -235,6 +235,35 @@ models:
+     ttl: 30m
+ ```
+ 
++#### GPU (Dynamic Resource Allocation, existing `ResourceClaim`)
++
++On a cluster where the GPU driver publishes devices through DRA (e.g. the
++NVIDIA DRA driver) instead of a device plugin, there is no `nvidia.com/gpu`
++resource to request. Create a `ResourceClaim` in the namespace and attach it
++with `--resource-claim`; the scheduler places the pod on the node holding
++the allocated device. Pods that reference the same claim share its device.
++
++```yaml
++models:
++  qwen25:
++    proxy: 127.0.0.1:${PORT}
++    cmd: |
++      kubeswap serve
++      --listen 127.0.0.1:${PORT}
++      --model qwen25
++      --namespace llama-swap
++      --image ghcr.io/mostlygeek/llama-swap:unified-cuda13
++      --command llama-server
++      --resource-claim gpu=single-gpu
++      --volume pvc:llama-swap-models:/models:ro
++      --
++      -hf bartowski/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M
++      --port 8080
++      --ctx-size 4096
++    cmdStop: kubeswap delete --model qwen25 --namespace llama-swap
++    ttl: 30m
++```
++
+ #### CPU (no `--gpu`, no node selector; lavapipe Vulkan works)
+ 
+ ```yaml
+@@ -534,6 +563,7 @@ in-cluster config else standard kubeconfig rules):
+ | `--probe-timeout` | `5s` | readiness/liveness probe request timeout |
+ | `--startup-timeout` | `10m` | model loading time the **startup probe** tolerates before the pod restarts; it also gates readiness/liveness until the backend answers once (llama-swap's global `healthCheckTimeout` should be at least this long) |
+ | `--gpu` | — | GPU resource, e.g. `amd.com/gpu=1` (sets requests **and** limits — GPUs are exclusive) |
++| `--resource-claim` | — | attach an existing DRA ResourceClaim `name=claim` to the pod and the container, e.g. `gpu=my-gpu-claim` (repeatable; `name` is a DNS-1123 label, unique per pod) |
+ | `--request` | — | resource request `name=quantity`, e.g. `cpu=2`, `memory=4Gi` (repeatable; overrides `--gpu` for the same key) |
+ | `--limit` | — | resource limit `name=quantity`, e.g. `cpu=4` (repeatable; overrides `--gpu` for the same key) |
+ | `--service-port` | — | extra Service port `name:port` (repeatable; e.g. expose backend metrics) |
+diff --git a/cmd/kubeswap/main.go b/cmd/kubeswap/main.go
+index b270429..e212c12 100644
+--- a/cmd/kubeswap/main.go
++++ b/cmd/kubeswap/main.go
+@@ -229,6 +229,40 @@ func parseGPUs(entries []string) (map[string]string, error) {
+ 	return out, nil
+ }
+ 
++// resourceClaimSpec is one parsed --resource-claim entry: the pod-level
++// claim name and the existing ResourceClaim it references.
++type resourceClaimSpec struct {
++	Name  string
++	Claim string
++}
++
++// parseResourceClaims parses "name=claim" entries, validating both with
++// the API server's own rules: the pod-level name is a DNS-1123 label and
++// the ResourceClaim name a DNS-1123 subdomain. Pod claim names must be
++// unique within the pod, so a repeated name is rejected.
++func parseResourceClaims(entries []string) ([]resourceClaimSpec, error) {
++	out := make([]resourceClaimSpec, 0, len(entries))
++	seen := map[string]bool{}
++	for _, e := range entries {
++		name, claim, ok := strings.Cut(e, "=")
++		if !ok {
++			return nil, fmt.Errorf("invalid --resource-claim %q (want name=claim, e.g. gpu=my-gpu-claim)", e)
++		}
++		if errs := content.IsDNS1123Label(name); len(errs) > 0 {
++			return nil, fmt.Errorf("invalid --resource-claim name %q: %v", name, errs)
++		}
++		if errs := content.IsDNS1123Subdomain(claim); len(errs) > 0 {
++			return nil, fmt.Errorf("invalid --resource-claim claim %q: %v", claim, errs)
++		}
++		if seen[name] {
++			return nil, fmt.Errorf("duplicate --resource-claim name %q", name)
++		}
++		seen[name] = true
++		out = append(out, resourceClaimSpec{Name: name, Claim: claim})
++	}
++	return out, nil
++}
++
+ // parseResources parses repeated "name=quantity" entries for resource
+ // requests or limits, validating the quantities up front.
+ func parseResources(entries []string, what string) (map[string]string, error) {
+diff --git a/cmd/kubeswap/objects.go b/cmd/kubeswap/objects.go
+index 13cf83f..f14c395 100644
+--- a/cmd/kubeswap/objects.go
++++ b/cmd/kubeswap/objects.go
+@@ -35,7 +35,8 @@ type serveConfig struct {
+ 	Requests       map[string]string // resource name -> quantity
+ 	Limits         map[string]string // resource name -> quantity
+ 	Env            []envVar
+-	GPUs           map[string]string // resource name -> quantity (requests AND limits)
++	GPUs           map[string]string   // resource name -> quantity (requests AND limits)
++	ResourceClaims []resourceClaimSpec // existing DRA ResourceClaims attached to the pod
+ 	NodeSel        map[string]string
+ 	Tolerations    []toleration
+ 	Volumes        []volumeSpec
+@@ -144,6 +145,7 @@ func (c *serveConfig) renderDeployment() (*appsv1.Deployment, error) {
+ 				},
+ 				Spec: corev1.PodSpec{
+ 					Containers:                    []corev1.Container{container},
++					ResourceClaims:                c.renderResourceClaims(),
+ 					Volumes:                       volumes,
+ 					NodeSelector:                  nodeSel,
+ 					Tolerations:                   c.renderTolerations(),
+@@ -237,10 +239,26 @@ func (c *serveConfig) renderResources() (corev1.ResourceRequirements, error) {
+ 		}
+ 		limits[corev1.ResourceName(k)] = qty
+ 	}
+-	if len(requests) == 0 && len(limits) == 0 {
+-		return corev1.ResourceRequirements{}, nil
++	var out corev1.ResourceRequirements
++	if len(requests) > 0 || len(limits) > 0 {
++		out.Requests, out.Limits = requests, limits
+ 	}
+-	return corev1.ResourceRequirements{Requests: requests, Limits: limits}, nil
++	// Each --resource-claim is also listed on the container: a pod-level
++	// claim only reaches the containers that name it.
++	for _, rc := range c.ResourceClaims {
++		out.Claims = append(out.Claims, corev1.ResourceClaim{Name: rc.Name})
++	}
++	return out, nil
++}
++
++// renderResourceClaims renders the --resource-claim entries as pod-level
++// claims referencing the existing ResourceClaims by name.
++func (c *serveConfig) renderResourceClaims() []corev1.PodResourceClaim {
++	var out []corev1.PodResourceClaim
++	for _, rc := range c.ResourceClaims {
++		out = append(out, corev1.PodResourceClaim{Name: rc.Name, ResourceClaimName: &rc.Claim})
++	}
++	return out
+ }
+ 
+ // renderTolerations Renders the parsed tolerations as corev1.Toleration values.
+@@ -371,8 +389,9 @@ func strPtr(s string) *string {
+ // desired one (used by --strict adoption). Every configuration-owned field
+ // is compared — the deployment's labels (which carry the extra --label
+ // entries), and in the pod template the image, command, args, env, ports,
+-// volumes, node selector, tolerations, grace period, probes and resources —
+-// so strict mode replaces the Deployment whenever any of them drifted.
++// volumes, resource claims, node selector, tolerations, grace period,
++// probes and resources — so strict mode replaces the Deployment whenever
++// any of them drifted.
+ func deploymentSpecMatches(have *appsv1.Deployment, want *appsv1.Deployment) bool {
+ 	if have == nil || want == nil {
+ 		return false
+@@ -392,6 +411,9 @@ func deploymentSpecMatches(have *appsv1.Deployment, want *appsv1.Deployment) boo
+ 	if !volumesEqual(hs.Volumes, ws.Volumes) {
+ 		return false
+ 	}
++	if !podResourceClaimsEqual(hs.ResourceClaims, ws.ResourceClaims) {
++		return false
++	}
+ 	if derefInt64(hs.TerminationGracePeriodSeconds) != derefInt64(ws.TerminationGracePeriodSeconds) {
+ 		return false
+ 	}
+@@ -485,9 +507,57 @@ func envsEqual(a, b []corev1.EnvVar) bool {
+ 	return true
+ }
+ 
+-// resourcesEqual Reports whether two resource requirement sets are equal (limits and requests).
++// resourcesEqual Reports whether two resource requirement sets are equal (limits, requests and claims).
+ func resourcesEqual(a, b corev1.ResourceRequirements) bool {
+-	return resourceListEqual(a.Limits, b.Limits) && resourceListEqual(a.Requests, b.Requests)
++	return resourceListEqual(a.Limits, b.Limits) && resourceListEqual(a.Requests, b.Requests) &&
++		containerClaimsEqual(a.Claims, b.Claims)
++}
++
++// containerClaimsEqual compares container resource claims as multisets
++// (order-insensitive).
++func containerClaimsEqual(a, b []corev1.ResourceClaim) bool {
++	if len(a) != len(b) {
++		return false
++	}
++	count := make(map[corev1.ResourceClaim]int, len(a))
++	for _, c := range a {
++		count[c]++
++	}
++	for _, c := range b {
++		if count[c] == 0 {
++			return false
++		}
++		count[c]--
++	}
++	return true
++}
++
++// podResourceClaimsEqual compares pod-level resource claims by name
++// (order-insensitive), matching the referenced ResourceClaim. An entry
++// without one (e.g. a hand-edited claim template) maps to "" and so never
++// matches a rendered claim; a name missing from b is drift, not "".
++func podResourceClaimsEqual(a, b []corev1.PodResourceClaim) bool {
++	byName := func(claims []corev1.PodResourceClaim) map[string]string {
++		m := make(map[string]string, len(claims))
++		for _, rc := range claims {
++			m[rc.Name] = ""
++			if rc.ResourceClaimName != nil {
++				m[rc.Name] = *rc.ResourceClaimName
++			}
++		}
++		return m
++	}
++	ma, mb := byName(a), byName(b)
++	if len(ma) != len(mb) {
++		return false
++	}
++	for k, v := range ma {
++		bv, ok := mb[k]
++		if !ok || bv != v {
++			return false
++		}
++	}
++	return true
+ }
+ 
+ // resourceListEqual Reports whether two resource lists hold the same quantities.
+diff --git a/cmd/kubeswap/objects_test.go b/cmd/kubeswap/objects_test.go
+index 224238a..d94ee49 100644
+--- a/cmd/kubeswap/objects_test.go
++++ b/cmd/kubeswap/objects_test.go
+@@ -159,6 +159,49 @@ func TestKubeswap_RenderDeploymentCPU(t *testing.T) {
+ 	}
+ }
+ 
++// TestKubeswap_RenderDeploymentResourceClaims Verifies --resource-claim renders the pod-level claim and the container reference.
++func TestKubeswap_RenderDeploymentResourceClaims(t *testing.T) {
++	cfg := testConfig()
++	cfg.ResourceClaims = []resourceClaimSpec{{Name: "gpu", Claim: "pro2000"}}
++	dep, err := cfg.renderDeployment()
++	if err != nil {
++		t.Fatalf("renderDeployment: %v", err)
++	}
++	pod := dep.Spec.Template.Spec
++	if len(pod.ResourceClaims) != 1 || pod.ResourceClaims[0].Name != "gpu" ||
++		pod.ResourceClaims[0].ResourceClaimName == nil || *pod.ResourceClaims[0].ResourceClaimName != "pro2000" ||
++		pod.ResourceClaims[0].ResourceClaimTemplateName != nil {
++		t.Errorf("pod resource claims: %+v", pod.ResourceClaims)
++	}
++	c := pod.Containers[0]
++	if len(c.Resources.Claims) != 1 || c.Resources.Claims[0] != (corev1.ResourceClaim{Name: "gpu"}) {
++		t.Errorf("container resource claims: %+v", c.Resources.Claims)
++	}
++	// Claims add to, not replace, the --gpu requests and limits.
++	if got := c.Resources.Limits[corev1.ResourceName("amd.com/gpu")]; got.String() != "1" {
++		t.Errorf("gpu limit: %v", c.Resources.Limits)
++	}
++
++	// A claim alone (no --gpu/--request/--limit) leaves requests and
++	// limits unset.
++	cfg.GPUs = nil
++	dep, err = cfg.renderDeployment()
++	if err != nil {
++		t.Fatalf("renderDeployment: %v", err)
++	}
++	r := dep.Spec.Template.Spec.Containers[0].Resources
++	if r.Requests != nil || r.Limits != nil || len(r.Claims) != 1 {
++		t.Errorf("claim-only resources: %+v", r)
++	}
++
++	// Without --resource-claim nothing is rendered.
++	cfg.ResourceClaims = nil
++	dep, _ = cfg.renderDeployment()
++	if dep.Spec.Template.Spec.ResourceClaims != nil || dep.Spec.Template.Spec.Containers[0].Resources.Claims != nil {
++		t.Errorf("expected no resource claims: %+v", dep.Spec.Template.Spec)
++	}
++}
++
+ // TestKubeswap_RenderService Verifies the Service rendered for a model.
+ func TestKubeswap_RenderService(t *testing.T) {
+ 	cfg := testConfig()
+@@ -509,6 +552,65 @@ func TestKubeswap_DeploymentSpecMatchesVolumes(t *testing.T) {
+ 	}
+ }
+ 
++// TestKubeswap_DeploymentSpecMatchesResourceClaims Verifies the spec comparison detects pod and container resource-claim drift, ignoring order.
++func TestKubeswap_DeploymentSpecMatchesResourceClaims(t *testing.T) {
++	cfg := testConfig()
++	cfg.ResourceClaims = []resourceClaimSpec{{Name: "gpu", Claim: "pro2000"}, {Name: "nic", Claim: "rdma"}}
++	dep, _ := cfg.renderDeployment()
++
++	// Reordered claims still match.
++	reordered := *cfg
++	reordered.ResourceClaims = []resourceClaimSpec{cfg.ResourceClaims[1], cfg.ResourceClaims[0]}
++	dep2, _ := reordered.renderDeployment()
++	if !deploymentSpecMatches(dep, dep2) {
++		t.Error("reordered resource claims should match")
++	}
++
++	// A different referenced claim is drift.
++	dep2, _ = cfg.renderDeployment()
++	other := "pro4000"
++	dep2.Spec.Template.Spec.ResourceClaims[0].ResourceClaimName = &other
++	if deploymentSpecMatches(dep, dep2) {
++		t.Error("referenced claim drift should not match")
++	}
++
++	// A claim template in place of the claim is drift.
++	dep2, _ = cfg.renderDeployment()
++	dep2.Spec.Template.Spec.ResourceClaims[0].ResourceClaimName = nil
++	dep2.Spec.Template.Spec.ResourceClaims[0].ResourceClaimTemplateName = &other
++	if deploymentSpecMatches(dep, dep2) {
++		t.Error("claim template in place of the claim should not match")
++	}
++
++	// A removed pod-level claim is drift.
++	dep2, _ = cfg.renderDeployment()
++	dep2.Spec.Template.Spec.ResourceClaims = dep2.Spec.Template.Spec.ResourceClaims[:1]
++	if deploymentSpecMatches(dep, dep2) {
++		t.Error("removed pod resource claim should not match")
++	}
++
++	// The container no longer naming a claim is drift.
++	dep2, _ = cfg.renderDeployment()
++	dep2.Spec.Template.Spec.Containers[0].Resources.Claims = dep2.Spec.Template.Spec.Containers[0].Resources.Claims[:1]
++	if deploymentSpecMatches(dep, dep2) {
++		t.Error("removed container resource claim should not match")
++	}
++
++	// A container claim narrowed to one request is drift.
++	dep2, _ = cfg.renderDeployment()
++	dep2.Spec.Template.Spec.Containers[0].Resources.Claims[0].Request = "gpu-0"
++	if deploymentSpecMatches(dep, dep2) {
++		t.Error("container claim request drift should not match")
++	}
++
++	// A deployment created before --resource-claim was added is drift.
++	cfg.ResourceClaims = nil
++	dep2, _ = cfg.renderDeployment()
++	if deploymentSpecMatches(dep, dep2) || deploymentSpecMatches(dep2, dep) {
++		t.Error("added resource claims should not match")
++	}
++}
++
+ // TestKubeswap_DeploymentSpecMatchesServicePorts Verifies the spec comparison detects service-port drift.
+ func TestKubeswap_DeploymentSpecMatchesServicePorts(t *testing.T) {
+ 	cfg := testConfig()
+diff --git a/cmd/kubeswap/parse_test.go b/cmd/kubeswap/parse_test.go
+index 1a2ea3d..0e60c03 100644
+--- a/cmd/kubeswap/parse_test.go
++++ b/cmd/kubeswap/parse_test.go
+@@ -57,6 +57,39 @@ func TestKubeswap_ParseGPUs(t *testing.T) {
+ 	}
+ }
+ 
++// TestKubeswap_ParseResourceClaims Verifies resource-claim parsing: the API server's name rules and duplicate names.
++func TestKubeswap_ParseResourceClaims(t *testing.T) {
++	got, err := parseResourceClaims([]string{"gpu=pro2000", "nic=rdma.claim-0"})
++	if err != nil {
++		t.Fatalf("unexpected error: %v", err)
++	}
++	want := []resourceClaimSpec{{Name: "gpu", Claim: "pro2000"}, {Name: "nic", Claim: "rdma.claim-0"}}
++	if !reflect.DeepEqual(got, want) {
++		t.Errorf("got %v, want %v", got, want)
++	}
++	for _, bad := range []string{
++		"gpu",                                // no claim
++		"=pro2000",                           // empty name
++		"gpu=",                               // empty claim
++		"g.pu=pro2000",                       // the pod-level name is a DNS-1123 label: no dots
++		"GPU=pro2000",                        // uppercase name
++		"gpu=Pro2000",                        // uppercase claim
++		"gpu=pro_2000",                       // '_' is not a subdomain character
++		strings.Repeat("g", 64) + "=pro2000", // 64-character label
++	} {
++		if _, err := parseResourceClaims([]string{bad}); err == nil {
++			t.Errorf("expected error for %q", bad)
++		}
++	}
++	if _, err := parseResourceClaims([]string{"gpu=a", "gpu=b"}); err == nil {
++		t.Error("expected error for duplicate name")
++	}
++	// Two pod-level names may reference the same claim.
++	if _, err := parseResourceClaims([]string{"a=shared", "b=shared"}); err != nil {
++		t.Errorf("distinct names on one claim should be valid: %v", err)
++	}
++}
++
+ // TestKubeswap_ParseTolerations Verifies toleration parsing: operator/effect validation and empty-effect preservation.
+ func TestKubeswap_ParseTolerations(t *testing.T) {
+ 	got, err := parseTolerations([]string{"dedicated:Exists::NoSchedule"})
+diff --git a/cmd/kubeswap/serve.go b/cmd/kubeswap/serve.go
+index bd9508d..99322b6 100644
+--- a/cmd/kubeswap/serve.go
++++ b/cmd/kubeswap/serve.go
+@@ -331,6 +331,7 @@ type serveFlags struct {
+ 	servicePorts         stringList
+ 	envs                 stringList
+ 	gpus                 stringList
++	resourceClaims       stringList
+ 	nodeSel              stringList
+ 	tols                 stringList
+ 	volumes              stringList
+@@ -368,6 +369,10 @@ func (f *serveFlags) toConfig() (*serveConfig, error) {
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	claims, err := parseResourceClaims(f.resourceClaims)
++	if err != nil {
++		return nil, err
++	}
+ 	nodeSel, err := parseKeyValues([]string(f.nodeSel), "node-selector")
+ 	if err != nil {
+ 		return nil, err
+@@ -448,6 +453,7 @@ func (f *serveFlags) toConfig() (*serveConfig, error) {
+ 		ServicePorts:   servicePorts,
+ 		Env:            envs,
+ 		GPUs:           gpus,
++		ResourceClaims: claims,
+ 		NodeSel:        nodeSel,
+ 		Tolerations:    tols,
+ 		Volumes:        volumes,
+@@ -478,6 +484,7 @@ func addServeFlags(fs *flag.FlagSet, f *serveFlags) {
+ 	fs.Var(&f.servicePorts, "service-port", "additional service port name:port (repeatable)")
+ 	fs.Var(&f.envs, "env", "container env var K=V (repeatable)")
+ 	fs.Var(&f.gpus, "gpu", "GPU resource to request, resource=count (e.g. amd.com/gpu=1, nvidia.com/gpu=1)")
++	fs.Var(&f.resourceClaims, "resource-claim", "existing DRA ResourceClaim to attach, name=claim (repeatable)")
+ 	fs.Var(&f.nodeSel, "node-selector", "node selector K=V (repeatable)")
+ 	fs.Var(&f.tols, "toleration", "toleration key:operator:value:effect (repeatable)")
+ 	fs.Var(&f.volumes, "volume", "volume pvc|emptydir|hostpath:name:path[:ro] (repeatable)")
+diff --git a/cmd/kubeswap/serve_test.go b/cmd/kubeswap/serve_test.go
+index 8daa1b4..8687096 100644
+--- a/cmd/kubeswap/serve_test.go
++++ b/cmd/kubeswap/serve_test.go
+@@ -96,6 +96,22 @@ func TestKubeswap_ToConfigRejectsReservedLabels(t *testing.T) {
+ 	}
+ }
+ 
++// TestKubeswap_ToConfigResourceClaims Verifies --resource-claim reaches the config and invalid entries fail at parse time.
++func TestKubeswap_ToConfigResourceClaims(t *testing.T) {
++	f := &serveFlags{model: "m", resourceClaims: stringList{"gpu=pro2000"}}
++	cfg, err := f.toConfig()
++	if err != nil {
++		t.Fatalf("toConfig: %v", err)
++	}
++	if len(cfg.ResourceClaims) != 1 || cfg.ResourceClaims[0] != (resourceClaimSpec{Name: "gpu", Claim: "pro2000"}) {
++		t.Errorf("got %v", cfg.ResourceClaims)
++	}
++	f = &serveFlags{model: "m", resourceClaims: stringList{"gpu=a", "gpu=b"}}
++	if _, err := f.toConfig(); err == nil || !strings.Contains(err.Error(), "--resource-claim") {
++		t.Errorf("duplicate name: got %v, want --resource-claim error", err)
++	}
++}
++
+ // TestKubeswap_ServeRejectsNegativeGrace Verifies a negative --grace is rejected at parse time.
+ func TestKubeswap_ServeRejectsNegativeGrace(t *testing.T) {
+ 	err := serveCmd([]string{
+diff --git a/docs/kb/guides/operations/kubeswap-kubernetes.md b/docs/kb/guides/operations/kubeswap-kubernetes.md
+index 45a6432..bb76ab0 100644
+--- a/docs/kb/guides/operations/kubeswap-kubernetes.md
++++ b/docs/kb/guides/operations/kubeswap-kubernetes.md
+@@ -2,9 +2,9 @@
+ title: Running inference servers in Kubernetes with kubeswap
+ summary: Use the kubeswap wrapper as cmd/cmdStop so llama-swap starts and stops backend servers as Kubernetes workloads in a dedicated namespace.
+ category: guides
+-tags: [kubernetes, kubeswap, deployment, k8s, operator, pod, namespace, pvc, gpu, multi-backend, sd-server, whisper-server, audiocpp_server]
++tags: [kubernetes, kubeswap, deployment, k8s, operator, pod, namespace, pvc, gpu, dra, resourceclaim, multi-backend, sd-server, whisper-server, audiocpp_server]
+ config_keys: [models.*.cmd, models.*.cmdStop, models.*.proxy, models.*.checkEndpoint, models.*.capabilities, healthCheckTimeout, unloadTimeout, routing]
+-updated: 2026-09-14
++updated: 2026-10-10
+ ---
+ 
+ # Running inference servers in Kubernetes with kubeswap
+@@ -108,6 +108,33 @@ exclusive device assigned by the scheduler.
+ 
+ Other vendors' device plugins register their own resource names — read the
+ real one from `kubectl describe node` under `Capacity` rather than guessing.
++
++On a cluster that exposes GPUs through Dynamic Resource Allocation (DRA)
++instead of a device plugin, there is no GPU resource under `Capacity`, and
++`--gpu` leaves the pod Pending forever. Create a `ResourceClaim` in the
++namespace and attach it with `--resource-claim name=claim` (repeatable):
++kubeswap adds it to the pod's `resourceClaims` and the container's
++`resources.claims`, and the scheduler places the pod on the node holding
++the allocated device. The claim must exist before the model loads (a
++missing claim also leaves the pod Pending; `kubeswap status` shows why),
++and every pod referencing it shares the device. kubeswap never creates or
++deletes the claim, so its RBAC needs no change.
++
++```yaml
++apiVersion: resource.k8s.io/v1
++kind: ResourceClaim
++metadata:
++  name: single-gpu
++  namespace: llama-swap
++spec:
++  devices:
++    requests:
++      - name: gpu
++        exactly:
++          deviceClassName: gpu.nvidia.com
++```
++
++Then use `--resource-claim gpu=single-gpu` in place of `--gpu`.
+ On CPU, drop GPU-only engine flags too (`-ngl` for llama-server is a no-op,
+ `--diffusion-fa` for sd-server needs a GPU; CPU image generation works but
+ is slow).
