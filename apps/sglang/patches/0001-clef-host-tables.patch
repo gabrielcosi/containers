@@ -1,0 +1,188 @@
+diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
+index 5befef1ff8..406767ffb6 100644
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -293,6 +293,8 @@ class Envs:
+     # Model configuration, discovery, and weight loading
+     # ===================================================================
+     SGLANG_USE_MODELSCOPE = EnvBool(False)
++    # Keep a Clef checkpoint's input embedding and LM head in mapped host memory.
++    SGLANG_CLEF_HOST_TABLES = EnvBool(False)
+     # Controls weight-file ordering for load-time I/O optimization.
+     #   -1 : no sorting, no staggering; preserves original file order.
+     #    0 : sort files only; maximizes ordering but may reduce cross-rank I/O concurrency.
+diff --git a/python/sglang/srt/layers/host_embedding.py b/python/sglang/srt/layers/host_embedding.py
+new file mode 100644
+index 0000000000..7d285e030b
+--- /dev/null
++++ b/python/sglang/srt/layers/host_embedding.py
+@@ -0,0 +1,68 @@
++"""Embedding tables kept in host memory and gathered by the GPU in place."""
++
++from typing import Optional
++
++import torch
++import torch.nn.functional as F
++from torch import nn
++
++from sglang.srt.model_loader.weight_utils import default_weight_loader
++from sglang.srt.utils import set_weight_attrs
++
++
++class _CudaArray:
++    """Describes registered host memory to torch as a CUDA array."""
++
++    def __init__(self, table: torch.Tensor):
++        self.__cuda_array_interface__ = {
++            "shape": tuple(table.shape),
++            # The interface has no bfloat16, so the alias is viewed back after.
++            "typestr": f"<i{table.element_size()}",
++            # UVA gives registered host memory the same address on the device.
++            "data": (table.data_ptr(), False),
++            "strides": None,
++            "version": 3,
++        }
++
++
++class HostEmbedding(nn.Module):
++    """An embedding table in page-locked host memory, read by the GPU directly.
++
++    A lookup moves only the rows it gathers over PCIe, uses no device memory and
++    does not synchronize. This suits tables a model only gathers rows from, such
++    as the input embedding, or the LM head of a model that computes no logits.
++    Not sharded: every rank holds the whole table.
++    """
++
++    def __init__(
++        self,
++        num_embeddings: int,
++        embedding_dim: int,
++        params_dtype: Optional[torch.dtype] = None,
++    ):
++        super().__init__()
++        self.num_embeddings = num_embeddings
++        self.org_vocab_size = num_embeddings
++        self.embedding_dim = embedding_dim
++        table = torch.empty(
++            num_embeddings,
++            embedding_dim,
++            dtype=params_dtype or torch.get_default_dtype(),
++            device="cpu",
++        )
++        # Registered in place: pin_memory() would round the size up to a power of two.
++        nbytes = table.numel() * table.element_size()
++        err = torch.cuda.cudart().cudaHostRegister(table.data_ptr(), nbytes, 0)
++        if int(err) != 0:
++            raise RuntimeError(f"cudaHostRegister({nbytes} bytes) failed: {err}")
++        self.weight = nn.Parameter(table, requires_grad=False)
++        # Copies into the registered buffer in place, which device_weight aliases.
++        self.weight_loader = default_weight_loader
++        set_weight_attrs(self.weight, {"weight_loader": default_weight_loader})
++        # Not a parameter or buffer, so module moves and state dicts skip it.
++        self.device_weight = torch.as_tensor(
++            _CudaArray(table), device=torch.cuda.current_device()
++        ).view(table.dtype)
++
++    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
++        return F.embedding(input_ids, self.device_weight)
+diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
+index 1f1e30dd52..b0c5264b6a 100644
+--- a/python/sglang/srt/models/qwen3_5.py
++++ b/python/sglang/srt/models/qwen3_5.py
+@@ -57,6 +57,7 @@ from sglang.srt.layers.dp_attention import (
+     is_dp_attention_enabled,
+ )
+ from sglang.srt.layers.flashinfer_comm_fusion import uses_cutedsl_ar_fusion
++from sglang.srt.layers.host_embedding import HostEmbedding
+ from sglang.srt.layers.joint_schema_head import JointSchemaHead, JointSchemaPooler
+ from sglang.srt.layers.layer_boundary import (
+     append_stages,
+@@ -2308,6 +2309,13 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
+         return loaded_params
+ 
+ 
++class Qwen3_5HostEmbeddingForCausalLM(Qwen3_5ForCausalLM):
++    """Qwen3.5 backbone whose input embedding stays in host memory."""
++
++    def _build_embed_tokens(self, config: Qwen3_5TextConfig) -> nn.Module:
++        return HostEmbedding(config.vocab_size, config.hidden_size)
++
++
+ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
+     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
+     hf_to_sglang_mapper = None
+@@ -2321,6 +2329,15 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
+         prefix: str = "",
+         language_model_cls=Qwen3_5ForCausalLM,
+     ):
++        if (
++            envs.SGLANG_CLEF_HOST_TABLES.get()
++            and config.architectures == ["Qwen3_5ForConditionalGeneration"]
++            and load_joint_head_config(get_model().model_path, get_model().revision)
++            is not None
++        ):
++            # A Clef checkpoint only gathers rows of its input embedding and LM
++            # head, so both can stay in host memory (see _build_lm_head).
++            language_model_cls = Qwen3_5HostEmbeddingForCausalLM
+         super().__init__(config, quant_config, prefix, language_model_cls)
+ 
+         rope_config = getattr(self.config, "rope_parameters", None) or getattr(
+@@ -2341,9 +2358,19 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
+                 # A Clef checkpoint, whose joint schema head scores every option
+                 # of every question from the final hidden states and LM head rows.
+                 self.pooler = JointSchemaPooler(
+-                    JointSchemaHead(**joint_head_config), lambda: self.lm_head.weight
++                    JointSchemaHead(**joint_head_config),
++                    lambda: getattr(self.lm_head, "device_weight", self.lm_head.weight),
+                 )
+ 
++    def _build_lm_head(
++        self, quant_config: Optional[QuantizationConfig], prefix: str
++    ) -> nn.Module:
++        if isinstance(self.model.embed_tokens, HostEmbedding):
++            # Never multiplied: the joint schema head computes no logits and
++            # gathers only the LM head rows of option tokens.
++            return HostEmbedding(self.config.vocab_size, self.config.hidden_size)
++        return super()._build_lm_head(quant_config, prefix)
++
+     def get_hidden_dim(self, module_name: str, layer_idx: int):
+         return self.model.get_hidden_dim(module_name, layer_idx)
+ 
+diff --git a/python/sglang/srt/models/qwen3_vl.py b/python/sglang/srt/models/qwen3_vl.py
+index 9e86550656..729fb19e25 100644
+--- a/python/sglang/srt/models/qwen3_vl.py
++++ b/python/sglang/srt/models/qwen3_vl.py
+@@ -1367,13 +1367,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
+                 ):
+                     self.lm_head = self.model.embed_tokens
+                 else:
+-                    self.lm_head = ParallelLMHead(
+-                        self.config.vocab_size,
+-                        self.config.hidden_size,
+-                        quant_config=quant_config,
+-                        use_attn_tp_group=get_parallel().enable_dp_lm_head,
+-                        prefix=add_prefix("lm_head", prefix),
+-                    )
++                    self.lm_head = self._build_lm_head(quant_config, prefix)
+             else:
+                 self.lm_head = PPMissingLayer()
+         else:
+@@ -1411,6 +1405,18 @@ class Qwen3VLForConditionalGeneration(nn.Module):
+         # For EAGLE3 support
+         self.capture_aux_hidden_states = False
+ 
++    def _build_lm_head(
++        self, quant_config: Optional[QuantizationConfig], prefix: str
++    ) -> nn.Module:
++        """LM head hook for models reusing this wrapper."""
++        return ParallelLMHead(
++            self.config.vocab_size,
++            self.config.hidden_size,
++            quant_config=quant_config,
++            use_attn_tp_group=get_parallel().enable_dp_lm_head,
++            prefix=add_prefix("lm_head", prefix),
++        )
++
+     def separate_deepstack_embeds(self, embedding):
+         assert embedding.shape[-1] % (1 + self.num_deepstack_embeddings) == 0, (
+             f"hidden_state of {embedding.shape} should be divisible by ({1 + self.num_deepstack_embeddings})"
