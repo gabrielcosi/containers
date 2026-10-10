@@ -15,7 +15,7 @@ COPY patches/ /patches/
 
 WORKDIR /src
 
-RUN for p in /patches/*.patch; do git apply --verbose "$p"; done
+RUN for p in /patches/*.patch; do git apply --verbose "$p" || exit 1; done
 
 RUN cmake -S . -B build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
