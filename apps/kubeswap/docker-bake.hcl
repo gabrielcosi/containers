@@ -5,7 +5,7 @@ variable "GIT_SHA" {}
 
 variable "VERSION" {
   // renovate: datasource=github-releases depName=mostlygeek/llama-swap versioning=regex:^v(?<patch>\d+)$
-  default = "v263"
+  default = "v264"
 }
 
 group "default" {
