@@ -1,5 +1,5 @@
 diff --git a/common/common.cpp b/common/common.cpp
-index 48caa80c1..4740bbc92 100644
+index c5db22832..e1dd8fc5f 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
 @@ -14,6 +14,8 @@
@@ -11,7 +11,7 @@ index 48caa80c1..4740bbc92 100644
  #include <algorithm>
  #include <cinttypes>
  #include <climits>
-@@ -2370,6 +2372,26 @@ void common_prompt_checkpoint::update_tgt(
+@@ -2399,6 +2401,26 @@ void common_prompt_checkpoint::update_tgt(
      }
  }
  
@@ -39,10 +39,10 @@ index 48caa80c1..4740bbc92 100644
          llama_context * ctx,
          llama_seq_id seq_id,
 diff --git a/common/common.h b/common/common.h
-index e0e56d288..54e9fe4b8 100644
+index 184343c54..d2b9a728f 100644
 --- a/common/common.h
 +++ b/common/common.h
-@@ -1293,6 +1293,13 @@ struct common_prompt_checkpoint {
+@@ -1306,6 +1306,13 @@ struct common_prompt_checkpoint {
              llama_seq_id seq_id,
              llama_state_seq_flags flags);
  
@@ -57,7 +57,7 @@ index e0e56d288..54e9fe4b8 100644
              llama_context * ctx,
              llama_seq_id seq_id,
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 9dcaf05a6..d294e3100 100644
+index 9ee64b566..b7fbc672a 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -7,6 +7,8 @@
@@ -77,7 +77,7 @@ index 9dcaf05a6..d294e3100 100644
  #include <unordered_map>
  
  //
-@@ -4456,6 +4459,47 @@ size_t llama_state_seq_get_data_ext(llama_context * ctx, uint8_t * dst, size_t s
+@@ -4568,6 +4571,47 @@ size_t llama_state_seq_get_data_ext(llama_context * ctx, uint8_t * dst, size_t s
  
      return ctx->state_seq_get_data(seq_id, dst, size, flags);
  }
@@ -126,10 +126,10 @@ index 9dcaf05a6..d294e3100 100644
      ctx->synchronize();
  
 diff --git a/src/llama-ext.h b/src/llama-ext.h
-index fcc78f47e..235297208 100644
+index 8b3932bd7..eac260c85 100644
 --- a/src/llama-ext.h
 +++ b/src/llama-ext.h
-@@ -130,6 +130,26 @@ LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uin
+@@ -138,6 +138,26 @@ LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uin
  
  LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
  
@@ -339,7 +339,7 @@ index 08489a4be..a51e3fb97 100644
      std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
  
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 723bc746b..0a92034ba 100644
+index 7f7e16422..9972563af 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -12,6 +12,7 @@
@@ -361,7 +361,7 @@ index 723bc746b..0a92034ba 100644
      // move_checkpoints: move the checkpoints into the cache instead of copying them, when the prompt is discarded next
      server_prompt_cache_state * prompt_save(server_prompt_cache & prompt_cache, bool move_checkpoints = false) {
          if (prompt.tokens.size() == 0) {
-@@ -1036,6 +1041,9 @@ private:
+@@ -1045,6 +1050,9 @@ private:
  
      common_speculative_ptr spec;
  
@@ -371,7 +371,7 @@ index 723bc746b..0a92034ba 100644
      bool add_bos_token = true;
  
      int32_t n_ctx; // total context for all clients / slots
-@@ -1452,6 +1460,19 @@ private:
+@@ -1461,6 +1469,19 @@ private:
              model_dft = nullptr;
          }
  
@@ -391,7 +391,7 @@ index 723bc746b..0a92034ba 100644
          if (!spec && params_base.speculative.has_synth()) {
              SRV_ERR("%s", "synthetic acceptance requires an initialized speculative decoding context\n");
              return false;
-@@ -2653,14 +2674,22 @@ private:
+@@ -2676,14 +2697,22 @@ private:
      }
  
      // n_tokens_cur: the number of tokens added to the batch for the current slot
@@ -416,7 +416,7 @@ index 723bc746b..0a92034ba 100644
              for (auto & ckpt : slot.prompt.checkpoints) {
                  if (ckpt.n_tokens == n_tokens_restored && ckpt.pos_min == pos_min && ckpt.pos_max == pos_max) {
                      SLT_TRC(slot, "reusing restored context checkpoint at n_tokens = %" PRId64 "\n", ckpt.n_tokens);
-@@ -2721,17 +2750,46 @@ private:
+@@ -2744,17 +2773,46 @@ private:
          //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
          cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
  
@@ -466,7 +466,7 @@ index 723bc746b..0a92034ba 100644
      // checkpoints are appended to the slot save file, after the llama state payload
      // they cannot be recreated from the final state alone (a recurrent state cannot be rewound)
      static constexpr uint32_t SLOT_CKPT_MAGIC   = 0x504b4353; // "SCKP"
-@@ -3672,6 +3730,9 @@ private:
+@@ -3783,6 +3841,9 @@ private:
  
                          slot.n_tokens_ckpt_restored = -1;
  
@@ -476,7 +476,7 @@ index 723bc746b..0a92034ba 100644
                          // empty prompt passed -> release the slot and send empty response
                          if (input_tokens.empty()) {
                              SLT_WRN(slot, "%s", "empty prompt - releasing slot\n");
-@@ -4086,6 +4147,29 @@ private:
+@@ -4204,6 +4265,29 @@ private:
  
                      const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
  
@@ -506,7 +506,7 @@ index 723bc746b..0a92034ba 100644
                      // add prompt tokens for processing in the current batch
                      while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
                          // get next token to process
-@@ -4148,6 +4232,14 @@ private:
+@@ -4266,6 +4350,14 @@ private:
                                  const int n_last = std::min(n_batch, offset);
                                  if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
                                      should_break = true;
@@ -521,7 +521,7 @@ index 723bc746b..0a92034ba 100644
                                      break;
                                  }
                              }
-@@ -4157,6 +4249,13 @@ private:
+@@ -4275,6 +4367,13 @@ private:
                          }
                      }
  
@@ -535,7 +535,7 @@ index 723bc746b..0a92034ba 100644
                      // the number of tokens added to the batch for the current slot
                      const auto n_tokens_cur = batch.size() - n_tokens_prev;
  
-@@ -4392,6 +4491,9 @@ private:
+@@ -4510,6 +4609,9 @@ private:
              }
          }
  
