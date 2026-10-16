@@ -339,7 +339,7 @@ index 08489a4be..a51e3fb97 100644
      std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
  
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 7f7e16422..9972563af 100644
+index ec11dcfec..a93bac0c1 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -12,6 +12,7 @@
@@ -361,7 +361,7 @@ index 7f7e16422..9972563af 100644
      // move_checkpoints: move the checkpoints into the cache instead of copying them, when the prompt is discarded next
      server_prompt_cache_state * prompt_save(server_prompt_cache & prompt_cache, bool move_checkpoints = false) {
          if (prompt.tokens.size() == 0) {
-@@ -1045,6 +1050,9 @@ private:
+@@ -1053,6 +1058,9 @@ private:
  
      common_speculative_ptr spec;
  
@@ -371,7 +371,7 @@ index 7f7e16422..9972563af 100644
      bool add_bos_token = true;
  
      int32_t n_ctx; // total context for all clients / slots
-@@ -1461,6 +1469,19 @@ private:
+@@ -1469,6 +1477,19 @@ private:
              model_dft = nullptr;
          }
  
@@ -391,7 +391,7 @@ index 7f7e16422..9972563af 100644
          if (!spec && params_base.speculative.has_synth()) {
              SRV_ERR("%s", "synthetic acceptance requires an initialized speculative decoding context\n");
              return false;
-@@ -2676,14 +2697,22 @@ private:
+@@ -2684,14 +2705,22 @@ private:
      }
  
      // n_tokens_cur: the number of tokens added to the batch for the current slot
@@ -416,7 +416,7 @@ index 7f7e16422..9972563af 100644
              for (auto & ckpt : slot.prompt.checkpoints) {
                  if (ckpt.n_tokens == n_tokens_restored && ckpt.pos_min == pos_min && ckpt.pos_max == pos_max) {
                      SLT_TRC(slot, "reusing restored context checkpoint at n_tokens = %" PRId64 "\n", ckpt.n_tokens);
-@@ -2744,17 +2773,46 @@ private:
+@@ -2752,17 +2781,46 @@ private:
          //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
          cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
  
@@ -466,7 +466,7 @@ index 7f7e16422..9972563af 100644
      // checkpoints are appended to the slot save file, after the llama state payload
      // they cannot be recreated from the final state alone (a recurrent state cannot be rewound)
      static constexpr uint32_t SLOT_CKPT_MAGIC   = 0x504b4353; // "SCKP"
-@@ -3783,6 +3841,9 @@ private:
+@@ -3791,6 +3849,9 @@ private:
  
                          slot.n_tokens_ckpt_restored = -1;
  
@@ -476,7 +476,7 @@ index 7f7e16422..9972563af 100644
                          // empty prompt passed -> release the slot and send empty response
                          if (input_tokens.empty()) {
                              SLT_WRN(slot, "%s", "empty prompt - releasing slot\n");
-@@ -4204,6 +4265,29 @@ private:
+@@ -4220,6 +4281,29 @@ private:
  
                      const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
  
@@ -506,7 +506,7 @@ index 7f7e16422..9972563af 100644
                      // add prompt tokens for processing in the current batch
                      while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
                          // get next token to process
-@@ -4266,6 +4350,14 @@ private:
+@@ -4282,6 +4366,14 @@ private:
                                  const int n_last = std::min(n_batch, offset);
                                  if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
                                      should_break = true;
@@ -521,7 +521,7 @@ index 7f7e16422..9972563af 100644
                                      break;
                                  }
                              }
-@@ -4275,6 +4367,13 @@ private:
+@@ -4291,6 +4383,13 @@ private:
                          }
                      }
  
@@ -535,7 +535,7 @@ index 7f7e16422..9972563af 100644
                      // the number of tokens added to the batch for the current slot
                      const auto n_tokens_cur = batch.size() - n_tokens_prev;
  
-@@ -4510,6 +4609,9 @@ private:
+@@ -4526,6 +4625,9 @@ private:
              }
          }
  

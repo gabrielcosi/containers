@@ -45,11 +45,50 @@ index 2cd6e2ec9..184343c54 100644
  
      std::string public_path   = "";                                                                         // NOLINT
      std::string api_prefix    = "";                                                                         // NOLINT
+diff --git a/src/llama-hparams.h b/src/llama-hparams.h
+index 3e025368b..49a1e1f45 100644
+--- a/src/llama-hparams.h
++++ b/src/llama-hparams.h
+@@ -510,6 +510,7 @@ struct llama_hparams {
+                 } break;
+             case LLAMA_SWA_TYPE_STANDARD:
+                 {
++                    // mirrored by server_slot::prompt_save (server-context.cpp), keep both in sync
+                     if (p1 - p0 >= (int32_t) n_swa) {
+                         return true;
+                     }
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index b7dfadef4..7aaa63b2c 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -2101,6 +2101,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
+ 
+             // check the cell is not SWA-masked
+             if (add_cell && seq_id != -1) {
++                // mirrored by server_slot::prompt_save (server-context.cpp), keep both in sync
+                 const bool is_masked = llama_hparams::is_masked_swa(n_swa, swa_type, cells.pos_get(i), cells.seq_pos_max(seq_id));
+ 
+                 add_cell = !is_masked;
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index a18b7542c..4939bb9be 100644
+index a18b7542c..7779cb6c6 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -978,6 +978,42 @@ public:
+@@ -323,6 +323,14 @@ struct server_slot {
+             return false;
+         }
+ 
++        cur->pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), id);
++
++        // the saved state leaves out the cells outside the SWA window (llama_kv_cache::state_write), so it
++        // restores with a later pos_min. this assumes STANDARD SWA; server_prompt_cache::load() warns on a mismatch
++        if (const int32_t n_swa_model = llama_model_n_swa(llama_get_model(ctx_tgt)); n_swa_model > 0) {
++            cur->pos_min = std::max(cur->pos_min, llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), id) - n_swa_model + 1);
++        }
++
+         llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+         if (ctx_dft) {
+             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+@@ -978,6 +986,42 @@ public:
          return metrics;
      }
  
@@ -92,7 +131,7 @@ index a18b7542c..4939bb9be 100644
      void reset_metrics_bucket() {
          metrics.reset_bucket();
      }
-@@ -1506,6 +1542,100 @@ private:
+@@ -1506,6 +1550,100 @@ private:
              SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
  
              prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
@@ -193,7 +232,66 @@ index a18b7542c..4939bb9be 100644
          } else {
              SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
          }
-@@ -4789,6 +4919,8 @@ bool server_context::load_model(common_params & params) {
+@@ -3779,11 +3917,13 @@ private:
+                                 n_past = 0;
+                             }
+ 
++                            // mirrored by server_prompt_n_reusable (server-task.cpp), keep both in sync
+                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
+ 
+                             // ref: https://github.com/ggml-org/llama.cpp/pull/24110
+                             const bool has_new_tokens = (n_past < slot.task->n_tokens());
+ 
++                            // mirrored by server_prompt_n_reusable (server-task.cpp), keep both in sync
+                             // the first evaluated token attends to the positions > pos_eval - n_swa, so a SWA state
+                             // starting at pos_eval - n_swa + 1 is enough, while a state without SWA must end before pos_eval
+                             const llama_pos pos_eval = pos_next - (has_new_tokens ? 0 : 1);
+@@ -3791,6 +3931,7 @@ private:
+                             // a state or a checkpoint is useful when its pos_min is below this threshold
+                             const auto pos_min_thold = std::max(0, n_swa > 0 ? pos_eval - n_swa + 2 : pos_eval);
+ 
++                            // mirrored by server_prompt_n_reusable (server-task.cpp), keep both in sync
+                             if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
+                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+                                 if (pos_min == -1) {
+@@ -3842,6 +3983,7 @@ private:
+                                 }
+ 
+                                 if (pos_min >= pos_min_thold) {
++                                    // mirrored by server_prompt_n_reusable (server-task.cpp), keep both in sync
+                                     // search for a context checkpoint
+                                     const auto it = std::find_if(
+                                         slot.prompt.checkpoints.rbegin(),
+@@ -3853,10 +3995,12 @@ private:
+                                             if (cur.pos_max > pos_next) {
+                                                 return false;
+                                             }
++                                            // mirrored by server_prompt_n_reusable (server-task.cpp), keep both in sync
+                                             return cur.pos_min < pos_min_thold || cur.pos_min == 0;
+                                         }
+                                     );
+ 
++                                    // mirrored by server_prompt_n_reusable (server-task.cpp), keep both in sync
+                                     bool do_reset = it == slot.prompt.checkpoints.rend();
+ 
+                                     if (!do_reset) {
+@@ -3876,6 +4020,7 @@ private:
+                                         // restore the draft's speculative state
+                                         common_speculative_set_state(spec.get(), slot.id, it->data_spec);
+ 
++                                        // mirrored by server_prompt_n_reusable (server-task.cpp), keep both in sync
+                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
+                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+@@ -3904,6 +4049,7 @@ private:
+                             }
+                         }
+ 
++                        // mirrored by server_prompt_n_reusable (server-task.cpp), keep both in sync
+                         // [TAG_PROMPT_LOGITS]
+                         if (n_past == slot.task->n_tokens() && n_past > 0) {
+                             SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
+@@ -4789,6 +4935,8 @@ bool server_context::load_model(common_params & params) {
  void server_context::start_loop() {
      auto & params = impl->params_base;
      impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
@@ -203,7 +301,7 @@ index a18b7542c..4939bb9be 100644
  
  void server_context::terminate() {
 diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
-index 3f30da2cd..38bbb6ccd 100644
+index 3f30da2cd..a30045b15 100644
 --- a/tools/server/server-task.cpp
 +++ b/tools/server/server-task.cpp
 @@ -1,5 +1,15 @@
@@ -222,7 +320,7 @@ index 3f30da2cd..38bbb6ccd 100644
  #include "build-info.h"
  #include "server-chat.h"
  #include "chat.h"
-@@ -1691,6 +1701,791 @@ json server_task_result_apply_lora::to_json() {
+@@ -1691,6 +1701,806 @@ json server_task_result_apply_lora::to_json() {
  //
  // server_prompt_cache
  //
@@ -239,7 +337,7 @@ index 3f30da2cd..38bbb6ccd 100644
 +
 +static const uint32_t SERVER_PROMPT_CACHE_FILE_MAGIC   = 0x50435331; // "PCS1"
 +static const uint32_t SERVER_PROMPT_CACHE_FILE_END     = 0x45534350; // "PCSE"
-+static const uint32_t SERVER_PROMPT_CACHE_FILE_VERSION = 3;
++static const uint32_t SERVER_PROMPT_CACHE_FILE_VERSION = 4;
 +
 +static const size_t SERVER_PROMPT_CACHE_TRAILER_SIZE = sizeof(uint64_t) + sizeof(uint32_t);
 +
@@ -249,6 +347,7 @@ index 3f30da2cd..38bbb6ccd 100644
 +struct server_prompt_spill_job {
 +    std::string path;
 +    uint64_t    fingerprint = 0;
++    llama_pos   pos_min     = -1;
 +
 +    std::vector<char>    tokens;
 +    std::vector<uint8_t> main;
@@ -271,6 +370,7 @@ index 3f30da2cd..38bbb6ccd 100644
 +    uint64_t n_drft;
 +    uint64_t n_ckpt;
 +    uint64_t n_ckpt_b;
++    int64_t  pos_min;
 +
 +    uint64_t payload() const {
 +        return n_packed + n_main + n_drft + n_ckpt_b;
@@ -286,7 +386,7 @@ index 3f30da2cd..38bbb6ccd 100644
 +    uint64_t size_spec;
 +};
 +
-+static_assert(sizeof(server_prompt_file_header) == 2*sizeof(uint32_t) + 6*sizeof(uint64_t), "padding in the file header");
++static_assert(sizeof(server_prompt_file_header) == 2*sizeof(uint32_t) + 7*sizeof(uint64_t), "padding in the file header");
 +static_assert(sizeof(server_prompt_file_ckpt)   == 6*sizeof(uint64_t),                      "padding in the checkpoint header");
 +
 +// checks the header against the file size and the trailer, which catches a file cut short
@@ -360,6 +460,7 @@ index 3f30da2cd..38bbb6ccd 100644
 +    hdr.n_drft      = job.drft.size();
 +    hdr.n_ckpt      = job.checkpoints.size();
 +    hdr.n_ckpt_b    = n_ckpt_b;
++    hdr.pos_min     = job.pos_min;
 +
 +    bool ok = true;
 +    const auto put = [&](const void * data, size_t size) {
@@ -426,27 +527,37 @@ index 3f30da2cd..38bbb6ccd 100644
 +    return true;
 +}
 +
-+// the number of tokens of `tokens_new` that restoring a state can keep. A state that diverges
-+// from the new prompt before its own end can only be rewound on recurrent or SWA memory by
-+// restoring a checkpoint at or before the divergence, so only those count.
-+// This mirrors the checkpoint eligibility rule of the checkpoint restore loop in
-+// server_context (server-context.cpp, `pos_min_thold`): when updating llama.cpp, check both.
++// the number of tokens of `tokens_new` that restoring a state can keep. On recurrent or SWA
++// memory, a state whose pos_min is too far past the divergence can only be rewound by restoring
++// a checkpoint at or before it.
++// This mirrors the reuse rule in server_context::update_slots (server-context.cpp); the marker
++// hunks of this patch next to that rule make `git apply` fail if upstream changes it.
 +static int server_prompt_n_reusable(
 +        const server_tokens & tokens,
 +        const std::vector<server_prompt_checkpoint_pos> & checkpoints,
++        llama_pos pos_min,
 +        const server_tokens & tokens_new,
 +        bool needs_checkpoint,
 +        int32_t n_swa) {
 +    const int lcp = tokens.get_common_prefix(tokens_new);
 +
-+    if (!needs_checkpoint || lcp >= (int) tokens.size()) {
-+        return lcp;
-+    }
-+
 +    const llama_pos pos_next      = tokens.pos_next(lcp);
 +    const bool      has_new       = lcp < (int) tokens_new.size();
 +    const llama_pos pos_eval      = pos_next - (has_new ? 0 : 1);
 +    const llama_pos pos_min_thold = std::max(0, n_swa > 0 ? pos_eval - n_swa + 2 : pos_eval);
++
++    // [TAG_PROMPT_LOGITS]
++    const auto n_kept = [&](int n_past) {
++        return n_past == (int) tokens_new.size() && n_past > 0 ? n_past - 1 : n_past;
++    };
++
++    if (lcp == 0) {
++        return 0;
++    }
++
++    if (!needs_checkpoint || pos_min < pos_min_thold) {
++        return n_kept(lcp);
++    }
 +
 +    for (auto it = checkpoints.rbegin(); it != checkpoints.rend(); ++it) {
 +        if (it->pos_max > pos_next) {
@@ -459,7 +570,7 @@ index 3f30da2cd..38bbb6ccd 100644
 +
 +        const llama_pos pos_ckpt = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
 +
-+        return (int) std::min(tokens.size_up_to_pos(pos_ckpt), (size_t) it->n_tokens);
++        return n_kept((int) std::min(tokens.size_up_to_pos(pos_ckpt), (size_t) it->n_tokens));
 +    }
 +
 +    return 0;
@@ -478,11 +589,11 @@ index 3f30da2cd..38bbb6ccd 100644
 +
 +int server_prompt_cache::n_reusable(const server_prompt_cache_state & state, const server_tokens & tokens_new) const {
 +    if (state.on_disk()) {
-+        return server_prompt_n_reusable(state.prompt.tokens, state.checkpoints_disk, tokens_new, needs_checkpoint, n_swa);
++        return server_prompt_n_reusable(state.prompt.tokens, state.checkpoints_disk, state.pos_min, tokens_new, needs_checkpoint, n_swa);
 +    }
 +
 +    return server_prompt_n_reusable(state.prompt.tokens, server_prompt_checkpoint_positions(state.prompt.checkpoints),
-+            tokens_new, needs_checkpoint, n_swa);
++            state.pos_min, tokens_new, needs_checkpoint, n_swa);
 +}
 +
 +void server_prompt_cache::writer_start() {
@@ -689,6 +800,7 @@ index 3f30da2cd..38bbb6ccd 100644
 +
 +        server_prompt_cache_state state;
 +        state.prompt           = std::move(prompt_cur);
++        state.pos_min          = (llama_pos) hdr.pos_min;
 +        state.path             = path_cur;
 +        state.size_disk        = size_file;
 +        state.checkpoints_disk = std::move(ckpts);
@@ -800,6 +912,7 @@ index 3f30da2cd..38bbb6ccd 100644
 +
 +    job->path        = (std::filesystem::path(dir) / ("state-" + std::to_string(i_file++) + ".bin")).string();
 +    job->fingerprint = fingerprint;
++    job->pos_min     = state.pos_min;
 +    job->main        = std::move(state.data.main);
 +    job->drft        = std::move(state.data.drft);
 +    job->checkpoints = std::move(state.prompt.checkpoints);
@@ -1014,7 +1127,7 @@ index 3f30da2cd..38bbb6ccd 100644
  size_t server_prompt_cache::size() const {
      size_t res = 0;
  
-@@ -1705,6 +2500,10 @@ size_t server_prompt_cache::n_tokens() const {
+@@ -1705,6 +2515,10 @@ size_t server_prompt_cache::n_tokens() const {
      size_t res = 0;
  
      for (const auto & state : states) {
@@ -1025,7 +1138,7 @@ index 3f30da2cd..38bbb6ccd 100644
          res += state.prompt.n_tokens();
      }
  
-@@ -1730,18 +2529,20 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+@@ -1730,18 +2544,20 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
  
      const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
  
@@ -1049,7 +1162,7 @@ index 3f30da2cd..38bbb6ccd 100644
              SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
  
              it = states.erase(it);
-@@ -1752,12 +2553,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+@@ -1752,12 +2568,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
  
      if (limit_size > 0) {
          // make room before allocating the new vectors to avoid breaching the limit
@@ -1063,7 +1176,7 @@ index 3f30da2cd..38bbb6ccd 100644
      }
  
      std::vector<uint8_t> state_data_tgt;
-@@ -1779,16 +2575,17 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+@@ -1779,16 +2590,17 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
          return nullptr;
      }
  
@@ -1091,14 +1204,14 @@ index 3f30da2cd..38bbb6ccd 100644
  
      return &states.back();
  }
-@@ -1796,37 +2593,50 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+@@ -1796,37 +2608,50 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
  bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
      const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
  
 -    float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
 -    float f_sim_best  = float(lcp_best) / tokens_new.size();
 +    const int n_base = server_prompt_n_reusable(prompt.tokens, server_prompt_checkpoint_positions(prompt.checkpoints),
-+            tokens_new, needs_checkpoint, n_swa);
++            llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), id_slot), tokens_new, needs_checkpoint, n_swa);
  
 -    SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 +    SRV_TRC(" - looking for better prompt, base lcp = %d, reusable = %d\n", lcp_best, n_base);
@@ -1155,7 +1268,7 @@ index 3f30da2cd..38bbb6ccd 100644
  
          {
              auto & data = it_best->data.main;
-@@ -1836,6 +2646,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+@@ -1836,9 +2661,17 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
              if (n != size) {
                  SRV_ERR("failed to restore state with size %zu\n", size);
  
@@ -1164,7 +1277,16 @@ index 3f30da2cd..38bbb6ccd 100644
                  return false;
              }
  
-@@ -1854,6 +2666,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
++            // the reuse prediction assumed this position
++            const llama_pos pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), id_slot);
++            if (pos_min != it_best->pos_min) {
++                SRV_WRN(" - restored state has pos_min = %d, expected %d\n", pos_min, it_best->pos_min);
++            }
++
+             data.clear();
+             data.shrink_to_fit();
+         }
+@@ -1854,6 +2687,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                  if (n != size) {
                      SRV_WRN("failed to restore state with size %zu\n", size);
  
@@ -1173,7 +1295,7 @@ index 3f30da2cd..38bbb6ccd 100644
                      return false;
                  }
  
-@@ -1862,21 +2676,37 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+@@ -1862,21 +2697,37 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
              }
          }
  
@@ -1218,7 +1340,7 @@ index 3f30da2cd..38bbb6ccd 100644
      }
  
      // average size per token
-@@ -1886,19 +2716,19 @@ void server_prompt_cache::update() {
+@@ -1886,19 +2737,19 @@ void server_prompt_cache::update() {
      const size_t limit_tokens_cur = limit_size > 0 ? std::max<size_t>(limit_tokens, limit_size/size_per_token) : limit_tokens;
  
      if (limit_tokens > 0) {
@@ -1248,7 +1370,7 @@ index 3f30da2cd..38bbb6ccd 100644
      }
  }
 diff --git a/tools/server/server-task.h b/tools/server/server-task.h
-index e7bb04398..cdda6013f 100644
+index e7bb04398..43774ad22 100644
 --- a/tools/server/server-task.h
 +++ b/tools/server/server-task.h
 @@ -7,6 +7,12 @@
@@ -1264,7 +1386,7 @@ index e7bb04398..cdda6013f 100644
  
  // TODO: prevent including the whole server-common.h as we only use server_tokens
  #include "server-common.h"
-@@ -650,10 +656,45 @@ struct server_prompt_data {
+@@ -650,10 +656,48 @@ struct server_prompt_data {
      }
  };
  
@@ -1283,6 +1405,9 @@ index e7bb04398..cdda6013f 100644
      server_prompt prompt;
      server_prompt_data data;
  
++    // the state's pos_min as it is after a restore, which decides whether it is reusable without a checkpoint
++    llama_pos pos_min = -1;
++
 +    // when non-empty, the state data lives in this file instead of in `data`.
 +    // the token list stays resident either way so prefix matching does not need the file.
 +    std::string path;
@@ -1310,7 +1435,7 @@ index e7bb04398..cdda6013f 100644
      size_t size() const {
          size_t res = data.size();
  
-@@ -671,6 +712,8 @@ struct server_prompt_cache {
+@@ -671,6 +715,8 @@ struct server_prompt_cache {
          this->limit_tokens = limit_tokens;
      }
  
@@ -1319,7 +1444,7 @@ index e7bb04398..cdda6013f 100644
      std::list<server_prompt_cache_state> states;
  
      // in bytes, 0 = no limit
-@@ -679,8 +722,32 @@ struct server_prompt_cache {
+@@ -679,8 +725,32 @@ struct server_prompt_cache {
      // in tokens, 0 = no limit
      size_t limit_tokens = 0;
  
@@ -1352,7 +1477,7 @@ index e7bb04398..cdda6013f 100644
      size_t n_tokens() const;
  
      server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
-@@ -688,6 +755,46 @@ struct server_prompt_cache {
+@@ -688,6 +758,46 @@ struct server_prompt_cache {
      bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
  
      void update();

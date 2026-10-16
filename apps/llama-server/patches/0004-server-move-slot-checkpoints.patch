@@ -1,5 +1,5 @@
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 4939bb9be..7f7e16422 100644
+index 7779cb6c6..ec11dcfec 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -305,9 +305,13 @@ struct server_slot {
@@ -29,8 +29,8 @@ index 4939bb9be..7f7e16422 100644
 +            return nullptr;
          }
  
-         llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-@@ -328,11 +332,11 @@ struct server_slot {
+         cur->pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), id);
+@@ -336,11 +340,11 @@ struct server_slot {
              llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
          }
  
@@ -45,7 +45,7 @@ index 4939bb9be..7f7e16422 100644
          if (!res) {
              SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
          }
-@@ -1917,9 +1921,10 @@ private:
+@@ -1925,9 +1929,10 @@ private:
  
                  const int64_t t_start = ggml_time_us();
  
@@ -58,7 +58,7 @@ index 4939bb9be..7f7e16422 100644
                      ret->prompt_clear();
                  }
  
-@@ -2674,6 +2679,20 @@ private:
+@@ -2682,6 +2687,20 @@ private:
      void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
          const int id_task = slot.task->id;
  
@@ -79,7 +79,7 @@ index 4939bb9be..7f7e16422 100644
          // evict checkpoints within min-step of a previous checkpoint, unless they were
          // created by the current task
          // only when the list is full, otherwise short prompts keep just the oldest checkpoint
-@@ -3015,7 +3034,7 @@ private:
+@@ -3023,7 +3042,7 @@ private:
                              if (!slot.is_processing()) {
                                  SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
  
@@ -88,7 +88,7 @@ index 4939bb9be..7f7e16422 100644
                                      SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
                                      prompt_cache->update();
                                  }
-@@ -3762,6 +3781,8 @@ private:
+@@ -3770,6 +3789,8 @@ private:
                          // keep track how many tokens we can reuse from the previous state
                          int n_past = 0;
  
@@ -97,8 +97,8 @@ index 4939bb9be..7f7e16422 100644
                          // empty prompt passed -> release the slot and send empty response
                          if (input_tokens.empty()) {
                              SLT_WRN(slot, "%s", "empty prompt - releasing slot\n");
-@@ -4008,6 +4029,7 @@ private:
- 
+@@ -4023,6 +4044,7 @@ private:
+                                         // mirrored by server_prompt_n_reusable (server-task.cpp), keep both in sync
                                          pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                          n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
 +                                        slot.n_tokens_ckpt_restored = it->n_tokens;
@@ -106,10 +106,10 @@ index 4939bb9be..7f7e16422 100644
                                      }
  
 diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
-index 38bbb6ccd..cb46c0bb1 100644
+index a30045b15..cadba26a1 100644
 --- a/tools/server/server-task.cpp
 +++ b/tools/server/server-task.cpp
-@@ -2510,7 +2510,7 @@ size_t server_prompt_cache::n_tokens() const {
+@@ -2525,7 +2525,7 @@ size_t server_prompt_cache::n_tokens() const {
      return res;
  }
  
@@ -118,7 +118,7 @@ index 38bbb6ccd..cb46c0bb1 100644
      // first check if the current state is contained fully in the cache
      for (auto it = states.begin(); it != states.end(); ++it) {
          const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
-@@ -2576,10 +2576,12 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+@@ -2591,10 +2591,12 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
      }
  
      server_prompt_cache_state state;
@@ -135,7 +135,7 @@ index 38bbb6ccd..cb46c0bb1 100644
      state.data = {
          /*.main =*/ std::move(state_data_tgt),
          /*.drft =*/ std::move(state_data_dft),
-@@ -2590,10 +2592,13 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+@@ -2605,10 +2607,13 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
      return &states.back();
  }
  
@@ -148,10 +148,10 @@ index 38bbb6ccd..cb46c0bb1 100644
 +    const auto & checkpoints_base = saved ? saved->prompt.checkpoints : prompt.checkpoints;
 +
 +    const int n_base = server_prompt_n_reusable(prompt.tokens, server_prompt_checkpoint_positions(checkpoints_base),
-             tokens_new, needs_checkpoint, n_swa);
+             llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), id_slot), tokens_new, needs_checkpoint, n_swa);
  
      SRV_TRC(" - looking for better prompt, base lcp = %d, reusable = %d\n", lcp_best, n_base);
-@@ -2635,6 +2640,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+@@ -2650,6 +2655,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
          it_best = states.end();
      }
  
@@ -163,10 +163,10 @@ index 38bbb6ccd..cb46c0bb1 100644
          SRV_TRC(" - found better prompt, reusable = %d\n", n_best);
  
 diff --git a/tools/server/server-task.h b/tools/server/server-task.h
-index cdda6013f..17a0be631 100644
+index 43774ad22..4f50dc6e5 100644
 --- a/tools/server/server-task.h
 +++ b/tools/server/server-task.h
-@@ -750,9 +750,12 @@ struct server_prompt_cache {
+@@ -753,9 +753,12 @@ struct server_prompt_cache {
  
      size_t n_tokens() const;
  
