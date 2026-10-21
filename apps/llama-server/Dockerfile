@@ -21,7 +21,6 @@ RUN cmake -S . -B build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DGGML_CUDA=ON \
         -DGGML_STATIC=ON \
-        -DCMAKE_CUDA_ARCHITECTURES=120 \
         -DGGML_CUDA_NCCL=OFF \
         -DGGML_NATIVE=OFF \
         -DBUILD_SHARED_LIBS=OFF \
