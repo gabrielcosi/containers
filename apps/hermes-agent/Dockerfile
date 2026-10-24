@@ -26,10 +26,12 @@ COPY plugins/crawl4ai /tmp/crawl4ai-plugin
 RUN cp -a /tmp/crawl4ai-plugin "$(/opt/hermes/.venv/bin/python -c 'import pathlib, plugins; print(pathlib.Path(plugins.__file__).parent / "web" / "crawl4ai")')" \
     && rm -rf /tmp/crawl4ai-plugin
 
-RUN mkdir -p /home/linuxbrew/.linuxbrew /opt/memini /opt/data/home \
-    && chown -R 10000:10000 /home/linuxbrew /opt/memini /opt/data
+RUN groupmod -g 1000 hermes \
+    && usermod -u 1000 -g 1000 hermes \
+    && mkdir -p /home/linuxbrew/.linuxbrew /opt/memini /opt/data/home \
+    && chown -R 1000:1000 /home/linuxbrew /opt/memini /opt/data
 
-USER 10000:10000
+USER 1000:1000
 
 ENV HOME=/opt/data/home
 ENV USER=hermes
