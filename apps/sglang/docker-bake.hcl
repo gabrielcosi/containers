@@ -5,7 +5,7 @@ variable "GIT_SHA" {}
 
 variable "VERSION" {
   // renovate: datasource=docker depName=docker.io/lmsysorg/sglang versioning=regex:^nightly-dev-cu13-(?<patch>\d{8})-[0-9a-f]+$
-  default = "nightly-dev-cu13-20261030-302b78cc"
+  default = "nightly-dev-cu13-20261031-a2cafa56"
 }
 
 group "default" {
