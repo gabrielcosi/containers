@@ -5,7 +5,7 @@ variable "GIT_SHA" {}
 
 variable "VERSION" {
   // renovate: datasource=github-releases depName=ggml-org/llama.cpp versioning=regex:^b(?<patch>\d+)$
-  default = "b12061"
+  default = "b12063"
 }
 
 group "default" {
