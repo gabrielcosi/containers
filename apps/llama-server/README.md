@@ -1,6 +1,6 @@
 # llama-server
 
-Upstream [llama.cpp](https://github.com/ggml-org/llama.cpp)'s CUDA `server` image (`.devops/cuda.Dockerfile`), plus the patches in [`patches/`](patches). It runs `/app/llama-server`. Tested only on the GPUs and models in my [LLMKube models](https://git.xcd.dev/gabrielcosi/home-ops/src/branch/main/kubernetes/apps/ai/llmkube/models); the patches can change with any update. [Issues](https://github.com/gabrielcosi/containers/issues) welcome.
+Upstream [llama.cpp](https://github.com/ggml-org/llama.cpp)'s CUDA `server` image (`.devops/cuda.Dockerfile`) without the web UI, plus the patches in [`patches/`](patches). It runs `/app/llama-server`. Tested only on the GPUs and models in my [LLMKube models](https://git.xcd.dev/gabrielcosi/home-ops/src/branch/main/kubernetes/apps/ai/llmkube/models); the patches can change with any update. [Issues](https://github.com/gabrielcosi/containers/issues) welcome.
 
 ## Patches
 
