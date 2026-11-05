@@ -13,7 +13,7 @@ WORKDIR /app
 
 RUN for p in /patches/*.patch; do git apply --verbose "$p" || exit 1; done
 
-FROM docker.io/node:24 AS web
+FROM docker.io/node:26 AS web
 
 ARG VERSION
 
