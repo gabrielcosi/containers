@@ -1,36 +1,43 @@
-FROM docker.io/nvidia/cuda:13.4.3-devel-ubuntu24.04 AS build
+FROM docker.io/nvidia/cuda:13.4.3-devel-ubuntu24.04 AS source
 
 ARG VERSION
+ARG GCC_VERSION=14
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        ca-certificates \
-        cmake \
-        git \
-        ninja-build \
-    && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && \
+    apt-get install -y gcc-${GCC_VERSION} g++-${GCC_VERSION} build-essential cmake python3 python3-pip git libssl-dev libgomp1
 
-ADD --keep-git-dir=true https://github.com/ggml-org/llama.cpp.git#${VERSION} /src
+ADD --keep-git-dir=true https://github.com/ggml-org/llama.cpp.git#${VERSION} /app
 COPY patches/ /patches/
 
-WORKDIR /src
+WORKDIR /app
 
 RUN for p in /patches/*.patch; do git apply --verbose "$p" || exit 1; done
 
-RUN cmake -S . -B build -G Ninja \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DGGML_CUDA=ON \
-        -DGGML_STATIC=ON \
-        -DGGML_CUDA_NCCL=OFF \
-        -DGGML_NATIVE=OFF \
-        -DBUILD_SHARED_LIBS=OFF \
-        -DLLAMA_CURL=OFF \
-        -DLLAMA_OPENSSL=OFF \
-        -DLLAMA_BUILD_TESTS=OFF \
-        -DLLAMA_BUILD_EXAMPLES=OFF \
-        "-DCMAKE_EXE_LINKER_FLAGS=-Wl,-rpath-link,/usr/local/cuda/lib64/stubs -lcuda" \
-    && cmake --build build -j"$(nproc)" --target llama-server \
-    && test -x build/bin/llama-server
+FROM docker.io/node:24 AS web
+
+ARG VERSION
+
+WORKDIR /app/tools/ui
+
+COPY --from=source /app/tools/ui/package.json /app/tools/ui/package-lock.json ./
+RUN npm ci
+
+COPY --from=source /app/tools/ui/ ./
+RUN LLAMA_BUILD_NUMBER="${VERSION#b}" npm run build
+
+FROM source AS build
+
+ARG GCC_VERSION=14
+
+ENV CC=gcc-${GCC_VERSION} CXX=g++-${GCC_VERSION} CUDAHOSTCXX=g++-${GCC_VERSION}
+
+COPY --from=web /app/tools/ui/dist tools/ui/dist
+
+RUN cmake -B build -DGGML_NATIVE=OFF -DGGML_CUDA=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DLLAMA_BUILD_TESTS=OFF -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined . && \
+    cmake --build build --config Release -j$(nproc)
+
+RUN mkdir -p /app/lib && \
+    find build -name "*.so*" -exec cp -P {} /app/lib \;
 
 FROM docker.io/nvidia/cuda:13.4.3-runtime-ubuntu24.04
 
@@ -42,10 +49,12 @@ RUN apt-get update \
     && find /var/cache/apt/archives /var/lib/apt/lists -not -name lock -type f -delete \
     && find /var/cache -type f -delete
 
-ENV LLAMA_ARG_HOST=0.0.0.0
+COPY --from=build /app/lib/ /app
 
-COPY --from=build /src/build/bin/llama-server /app/llama-server
-RUN ln -s /app/llama-server /llama-server
+ENV LLAMA_ARG_HOST=0.0.0.0
+ENV LLAMA_ARG_PORT=8080
+
+COPY --from=build /app/build/bin/llama /app/build/bin/llama-server /app/
 
 WORKDIR /app
 
