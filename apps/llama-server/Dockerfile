@@ -32,5 +32,23 @@ RUN cmake -S . -B build -G Ninja \
     && cmake --build build -j"$(nproc)" --target llama-server \
     && test -x build/bin/llama-server
 
-FROM docker.io/library/busybox:1.38.0@sha256:a46257e06c82ad85242d0d38077d0a52d9896389ca60a1a59d3463db586e5fa4
-COPY --from=build /src/build/bin/llama-server /llama-server
+FROM docker.io/nvidia/cuda:13.4.3-runtime-ubuntu24.04
+
+RUN apt-get update \
+    && apt-get install -y libgomp1 curl ffmpeg \
+    && apt autoremove -y \
+    && apt clean -y \
+    && rm -rf /tmp/* /var/tmp/* \
+    && find /var/cache/apt/archives /var/lib/apt/lists -not -name lock -type f -delete \
+    && find /var/cache -type f -delete
+
+ENV LLAMA_ARG_HOST=0.0.0.0
+
+COPY --from=build /src/build/bin/llama-server /app/llama-server
+RUN ln -s /app/llama-server /llama-server
+
+WORKDIR /app
+
+HEALTHCHECK CMD [ "curl", "-f", "http://localhost:8080/health" ]
+
+ENTRYPOINT [ "/app/llama-server" ]

@@ -1,6 +1,6 @@
 # llama-server
 
-Upstream [llama.cpp](https://github.com/ggml-org/llama.cpp) `llama-server`, built with CUDA for llama.cpp's default architectures, plus the patches in [`patches/`](patches). The image holds only the binary at `/llama-server`. Tested only on the GPUs and models in my [llama-swap config](https://git.xcd.dev/gabrielcosi/home-ops/src/branch/main/kubernetes/apps/ai/llama-swap/app/config.yaml); the patches can change with any update. [Issues](https://github.com/gabrielcosi/containers/issues) welcome.
+Upstream [llama.cpp](https://github.com/ggml-org/llama.cpp) `llama-server`, built with CUDA for llama.cpp's default architectures, plus the patches in [`patches/`](patches). The runtime stage follows upstream's `server` image (`.devops/cuda.Dockerfile`) and runs `/app/llama-server`; `/llama-server` links to it. Tested only on the GPUs and models in my [llama-swap config](https://git.xcd.dev/gabrielcosi/home-ops/src/branch/main/kubernetes/apps/ai/llama-swap/app/config.yaml); the patches can change with any update. [Issues](https://github.com/gabrielcosi/containers/issues) welcome.
 
 ## Patches
 
