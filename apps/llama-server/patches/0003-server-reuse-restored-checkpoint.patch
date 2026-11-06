@@ -1,0 +1,66 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 4b78d44c4..f80205f45 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -340,6 +340,13 @@ struct server_slot {
+ 
+     server_prompt prompt;
+ 
++    // n_tokens of the context checkpoint restored for the current task, -1 if none
++    int64_t n_tokens_ckpt_restored = -1;
++
++    // the restored context checkpoint the current task reused instead of creating it again, kept like one created by
++    // the task. it is shared with the prompt cache, so its id_task stays as is. only compared, never dereferenced
++    const common_prompt_checkpoint * ckpt_reused = nullptr;
++
+     bool prompt_save(server_prompt_cache & prompt_cache) const {
+         if (prompt.tokens.size() == 0) {
+             return false;
+@@ -2865,6 +2872,20 @@ private:
+     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+         const int id_task = slot.task->id;
+ 
++        // the checkpoint restored for this task holds the current state if nothing was decoded since
++        const int64_t n_tokens_restored = slot.n_tokens_ckpt_restored;
++        slot.n_tokens_ckpt_restored = -1;
++
++        if (n_tokens_restored == slot.prompt.n_tokens() - n_tokens_cur) {
++            for (const auto & ckpt : slot.prompt.checkpoints) {
++                if (ckpt->n_tokens == n_tokens_restored && ckpt->pos_min == pos_min && ckpt->pos_max == pos_max) {
++                    SLT_TRC(slot, "reusing restored context checkpoint at n_tokens = %" PRId64 "\n", ckpt->n_tokens);
++                    slot.ckpt_reused = ckpt.get();
++                    return;
++                }
++            }
++        }
++
+         // evict checkpoints within min-step of a previous checkpoint, unless they were
+         // created by the current task
+         // only when the list is full, otherwise short prompts keep just the oldest checkpoint
+@@ -2873,7 +2894,7 @@ private:
+                 slot.prompt.checkpoints.size() + 1 >= (size_t) params_base.n_ctx_checkpoints &&
+                 it != slot.prompt.checkpoints.end(); ) {
+             const auto & cur = **it;
+-            if (cur.id_task != id_task && last >= 0 && cur.n_tokens <= last + params_base.checkpoint_min_step) {
++            if (cur.id_task != id_task && &cur != slot.ckpt_reused && last >= 0 && cur.n_tokens <= last + params_base.checkpoint_min_step) {
+                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                         cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+ 
+@@ -4185,6 +4206,9 @@ private:
+                         // keep track how many tokens we can reuse from the previous state
+                         int n_past = 0;
+ 
++                        slot.n_tokens_ckpt_restored = -1;
++                        slot.ckpt_reused            = nullptr;
++
+                         // empty prompt passed -> release the slot and send empty response
+                         if (input_tokens.empty()) {
+                             SLT_WRN(slot, "%s", "empty prompt - releasing slot\n");
+@@ -4448,6 +4472,7 @@ private:
+                                         // mirrored by server_prompt_n_reusable (server-task.cpp), keep both in sync
+                                         pos_next = std::min(pos_next, std::max(cur.pos_min + 1, cur.pos_max));
+                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) cur.n_tokens);
++                                        slot.n_tokens_ckpt_restored = cur.n_tokens;
+                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_past, (float) cur.size() / 1024 / 1024);
+                                     }
+ 
