@@ -1,4 +1,4 @@
-FROM docker.io/nvidia/cuda:13.4.3-devel-ubuntu24.04 AS build
+FROM docker.io/nvidia/cuda:13.5.0-devel-ubuntu24.04 AS build
 
 ARG VERSION
 ARG GCC_VERSION=14
@@ -21,7 +21,7 @@ RUN cmake -B build -DGGML_NATIVE=OFF -DGGML_CUDA=ON -DGGML_BACKEND_DL=ON -DGGML_
 RUN mkdir -p /app/lib && \
     find build -name "*.so*" -exec cp -P {} /app/lib \;
 
-FROM docker.io/nvidia/cuda:13.4.3-runtime-ubuntu24.04
+FROM docker.io/nvidia/cuda:13.5.0-runtime-ubuntu24.04
 
 RUN apt-get update \
     && apt-get install -y libgomp1 curl ffmpeg \
