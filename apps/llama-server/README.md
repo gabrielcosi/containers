@@ -5,10 +5,8 @@ Upstream [llama.cpp](https://github.com/ggml-org/llama.cpp)'s CUDA `server` imag
 ## Patches
 
 - `0001`: `GGML_CUDA_MMVQ_MAX_NVFP4=<n>` sets the largest batch size that uses the MMVQ kernel for NVFP4.
-- `0002`: applies the NVFP4 scales to the gate and FFN weights of Muse Glimmer models.
-- `0003`: disk prompt cache, below.
-- `0004`: moves context checkpoints into the prompt cache instead of copying them.
-- `0005`: for recurrent and hybrid models with speculative decoding such as MTP (not EAGLE3), takes the last prompt checkpoint without decoding the end of the prompt in a separate batch.
+- `0002`: disk prompt cache, below.
+- `0003`: when the first checkpoint of a request falls on the context checkpoint it just restored, keeps that one instead of saving the same state again.
 
 ## Disk prompt cache
 
