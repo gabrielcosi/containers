@@ -5,7 +5,7 @@ variable "GIT_SHA" {}
 
 variable "VERSION" {
   // renovate: datasource=docker depName=ghcr.io/koush/scrypted versioning=regex:^v(?<major>\d+)\.(?<minor>\d+)\.(?<patch>\d+)-noble-full$
-  default = "v0.147.0-noble-full"
+  default = "v0.148.0-noble-full"
 }
 
 group "default" {
