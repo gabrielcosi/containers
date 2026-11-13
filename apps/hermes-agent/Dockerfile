@@ -18,10 +18,6 @@ RUN apt-get update \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-RUN VIRTUAL_ENV=/opt/hermes/.venv \
-    && HERMES_VERSION=$(uv pip show hermes-agent | awk '/^Version:/ {print $2}') \
-    && uv pip install --no-cache "hermes-agent[firecrawl,messaging]==${HERMES_VERSION}"
-
 COPY plugins/crawl4ai /tmp/crawl4ai-plugin
 RUN cp -a /tmp/crawl4ai-plugin "$(/opt/hermes/.venv/bin/python -c 'import pathlib, plugins; print(pathlib.Path(plugins.__file__).parent / "web" / "crawl4ai")')" \
     && rm -rf /tmp/crawl4ai-plugin
