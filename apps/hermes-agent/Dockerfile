@@ -11,7 +11,7 @@ RUN git clone --depth 1 --branch "v${MEMINI_VERSION}" https://github.com/elebouc
     && rm -rf /tmp/memini-src
 
 COPY plugins/crawl4ai /opt/hermes/plugins/web/crawl4ai
-COPY profile.d/mise.sh /etc/profile.d/mise.sh
+COPY defaults/mise.sh /etc/profile.d/mise.sh
 
 RUN groupmod -g 1000 hermes \
     && usermod -u 1000 -g 1000 hermes \
