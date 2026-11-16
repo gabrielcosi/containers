@@ -5,7 +5,7 @@ variable "GIT_SHA" {}
 
 variable "VERSION" {
   // renovate: datasource=docker depName=docker.io/nousresearch/hermes-agent versioning=regex:^v(?<major>\d+)\.(?<minor>\d+)\.(?<patch>\d+)$
-  default = "v0.23.1"
+  default = "v0.23.2"
 }
 
 group "default" {
