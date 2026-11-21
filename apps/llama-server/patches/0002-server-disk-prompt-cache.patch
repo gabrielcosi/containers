@@ -1,8 +1,8 @@
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 69be4a61e..a27f984a8 100644
+index a63823767..6bc7c79bd 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
-@@ -1691,6 +1691,29 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -1704,6 +1704,29 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              params.cache_ram_explicit = true;
          }
      ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
@@ -33,10 +33,10 @@ index 69be4a61e..a27f984a8 100644
          {"-kvu", "--kv-unified"},
          {"-no-kvu", "--no-kv-unified"},
 diff --git a/common/common.h b/common/common.h
-index 84abddc76..d5eebdf89 100644
+index a8e89ed2d..181550771 100644
 --- a/common/common.h
 +++ b/common/common.h
-@@ -644,6 +644,8 @@ struct common_params {
+@@ -663,6 +663,8 @@ struct common_params {
      int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
      int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
      bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
@@ -45,57 +45,40 @@ index 84abddc76..d5eebdf89 100644
  
      // llama-connect params
      bool        server_connect      = false;
-diff --git a/src/llama-hparams.h b/src/llama-hparams.h
-index 7b738407d..650390369 100644
---- a/src/llama-hparams.h
-+++ b/src/llama-hparams.h
-@@ -550,6 +550,7 @@ struct llama_hparams {
-                 } break;
-             case LLAMA_SWA_TYPE_STANDARD:
-                 {
-+                    // mirrored by server_slot::prompt_save (server-context.cpp), keep both in sync
-                     if (p1 - p0 >= (int32_t) n_swa) {
-                         return true;
-                     }
-diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index a1ec67e26..a1131fac4 100644
---- a/src/llama-kv-cache.cpp
-+++ b/src/llama-kv-cache.cpp
-@@ -2237,6 +2237,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
+diff --git a/tools/server/CMakeLists.txt b/tools/server/CMakeLists.txt
+index 9f9393f98..c2a86cdfa 100644
+--- a/tools/server/CMakeLists.txt
++++ b/tools/server/CMakeLists.txt
+@@ -29,6 +29,8 @@ add_library(${TARGET} STATIC
+     server-schema.h
+     server-slot-sched.cpp
+     server-slot-sched.h
++    server-prompt-disk.cpp
++    server-prompt-disk.h
+ )
  
-             // check the cell is not SWA-masked
-             if (add_cell && seq_id != -1) {
-+                // mirrored by server_slot::prompt_save (server-context.cpp), keep both in sync
-                 const bool is_masked = llama_hparams::is_masked_swa(n_swa, swa_type, cells.pos_get(i), cells.seq_pos_max(seq_id));
- 
-                 add_cell = !is_masked;
+ if (BUILD_SHARED_LIBS)
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 78c8ef149..7b7719afe 100644
+index bfade25d7..1bd01161e 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -358,6 +358,14 @@ struct server_slot {
+@@ -368,6 +368,8 @@ struct server_slot {
              return false;
          }
  
 +        cur->pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), id);
 +
-+        // the saved state leaves out the cells outside the SWA window (llama_kv_cache::state_write), so it
-+        // restores with a later pos_min. this assumes STANDARD SWA; server_prompt_cache::load() warns on a mismatch
-+        if (const int32_t n_swa_model = llama_model_n_swa(llama_get_model(ctx_tgt)); n_swa_model > 0) {
-+            cur->pos_min = std::max(cur->pos_min, llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), id) - n_swa_model + 1);
-+        }
-+
          const size_t n_tgt = llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
          const size_t n_dft = ctx_dft ? llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
          if (n_tgt != cur_size_tgt || n_dft != cur_size_dft) {
-@@ -1068,6 +1076,42 @@ public:
+@@ -1084,6 +1086,42 @@ public:
          return metrics;
      }
  
 +    // on shutdown, save what the slots hold and write the whole prompt cache to disk, so the
 +    // next run can resume these conversations without decoding them again
 +    void persist_prompt_cache() {
-+        if (!prompt_cache || prompt_cache->dir.empty() || sleeping || ctx_tgt == nullptr) {
++        if (!prompt_cache || !prompt_cache->disk || sleeping || ctx_tgt == nullptr) {
 +            return;
 +        }
 +
@@ -125,195 +108,24 @@ index 78c8ef149..7b7719afe 100644
 +            slot.prompt_save(*prompt_cache);
 +        }
 +
-+        prompt_cache->flush();
++        prompt_cache->flush_disk();
 +    }
 +
      void reset_metrics_bucket() {
          metrics.reset_bucket();
      }
-@@ -1603,6 +1647,100 @@ private:
+@@ -1630,6 +1668,10 @@ private:
              SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
  
              prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
 +
 +            if (!params_base.cache_dir.empty() && params_base.cache_disk_mib != 0) {
-+                // the state blobs are only meaningful for this exact model and context layout
-+                // a file is identified by its path, size and modification time, so replacing a
-+                // model file in place invalidates the states computed with the old one
-+                const auto file_id = [](const std::string & path) -> std::string {
-+                    if (path.empty()) {
-+                        return "-";
-+                    }
-+                    std::error_code ec;
-+                    const auto size  = std::filesystem::file_size(path, ec);
-+                    const auto mtime = std::filesystem::last_write_time(path, ec);
-+                    return path + ":" + std::to_string(size) + ":" +
-+                        std::to_string((long long) mtime.time_since_epoch().count());
-+                };
-+
-+                const auto & draft = params_base.speculative.draft;
-+
-+                // the build too: the state layout can change between versions with the same sizes
-+                std::string sig =
-+                    std::string(llama_build_info()) + "|" +
-+                    file_id(params_base.model.path) + "|" +
-+                    file_id(draft.mparams.path) + "|" +
-+                    file_id(params_base.mmproj.path) + "|" +
-+                    std::to_string(n_ctx) + "|" +
-+                    std::to_string(params_base.n_parallel) + "|" +
-+                    std::to_string(params_base.kv_unified) + "|" +
-+                    std::to_string(params_base.kv_unified_per_slot) + "|" +
-+                    std::to_string(params_base.swa_full) + "|" +
-+                    std::to_string((int) params_base.flash_attn_type) + "|" +
-+                    std::to_string((int) params_base.cache_type_k) + "|" +
-+                    std::to_string((int) params_base.cache_type_v) + "|" +
-+                    std::to_string((int) draft.cache_type_k) + "|" +
-+                    std::to_string((int) draft.cache_type_v) + "|" +
-+                    std::to_string(ctx_dft != nullptr) + "|" +
-+                    std::to_string(params_base.rope_freq_base) + "|" +
-+                    std::to_string(params_base.rope_freq_scale) + "|" +
-+                    std::to_string(params_base.yarn_ext_factor) + "|" +
-+                    std::to_string(params_base.yarn_attn_factor) + "|" +
-+                    std::to_string(params_base.yarn_beta_fast) + "|" +
-+                    std::to_string(params_base.yarn_beta_slow) + "|" +
-+                    std::to_string(params_base.yarn_orig_ctx);
-+
-+                for (const auto & la : params_base.lora_adapters) {
-+                    sig += "|lora:" + file_id(la.path) + ":" + std::to_string(la.scale);
-+                }
-+
-+                for (const auto & cv : params_base.control_vectors) {
-+                    sig += "|cvec:" + file_id(cv.fname) + ":" + std::to_string(cv.strength);
-+                }
-+                sig += "|" + std::to_string(params_base.control_vector_layer_start) + ":" +
-+                    std::to_string(params_base.control_vector_layer_end);
-+
-+                for (const auto & kvo : params_base.kv_overrides) {
-+                    if (kvo.key[0] == 0) {
-+                        continue;
-+                    }
-+                    sig += "|kv:" + std::string(kvo.key) + "=" + std::to_string((int) kvo.tag) + ":";
-+                    switch (kvo.tag) {
-+                        case LLAMA_KV_OVERRIDE_TYPE_INT:   sig += std::to_string(kvo.val_i64);  break;
-+                        case LLAMA_KV_OVERRIDE_TYPE_FLOAT: sig += std::to_string(kvo.val_f64);  break;
-+                        case LLAMA_KV_OVERRIDE_TYPE_BOOL:  sig += std::to_string(kvo.val_bool); break;
-+                        case LLAMA_KV_OVERRIDE_TYPE_STR:   sig += std::string(kvo.val_str);     break;
-+                    }
-+                }
-+
-+                uint64_t fingerprint = 0xcbf29ce484222325ull;
-+                for (const char c : sig) {
-+                    fingerprint = (fingerprint ^ (uint8_t) c) * 0x100000001b3ull;
-+                }
-+
-+                prompt_cache->dir             = params_base.cache_dir;
-+                prompt_cache->fingerprint     = fingerprint;
-+                prompt_cache->limit_size_disk = params_base.cache_disk_mib < 0 ?
-+                    0 : 1024ull*1024ull*params_base.cache_disk_mib;
-+
-+                prompt_cache->has_mtmd = mctx != nullptr;
-+
-+                prompt_cache->needs_checkpoint =
-+                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-+                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS   ||
-+                    n_swa > 0;
-+                prompt_cache->n_swa = n_swa;
-+
-+                const size_t n_adopted = prompt_cache->index_dir(ctx_tgt);
-+                if (n_adopted > 0) {
-+                    SRV_WRN("adopted %zu prompt cache state(s) from an earlier run (%.3f MiB)\n",
-+                            n_adopted, prompt_cache->size_disk() / (1024.0 * 1024.0));
-+                }
-+
-+                SRV_TRC("prompt cache spills to '%s', disk limit: %s\n", params_base.cache_dir.c_str(),
-+                        params_base.cache_disk_mib < 0 ? "no limit" :
-+                            (std::to_string(params_base.cache_disk_mib) + " MiB").c_str());
++                prompt_cache->init_disk(params_base, n_ctx, ctx_tgt, ctx_dft != nullptr, mctx != nullptr, n_swa_reuse);
 +            }
          } else {
              SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
          }
-@@ -4120,6 +4258,7 @@ private:
- 
-                             if (slot.task->params.cache_prompt && !slot.task->is_stateless()) {
-                                 // reuse any previously computed tokens that are common with the new prompt
-+                                // mirrored by server_prompt_n_reusable (server-task.cpp), keep both in sync
-                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
- 
-                                 // the children start from the shared prefix, do not go past it
-@@ -4202,6 +4341,7 @@ private:
-                                 n_past = 0;
-                             }
- 
-+                            // mirrored by server_prompt_n_reusable (server-task.cpp), keep both in sync
-                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
- 
-                             // number of cached tokens shared with the new prompt, before any checkpoint is restored
-@@ -4210,6 +4350,7 @@ private:
-                             // ref: https://github.com/ggml-org/llama.cpp/pull/24110
-                             const bool has_new_tokens = (n_past < slot.task->n_tokens());
- 
-+                            // mirrored by server_prompt_n_reusable (server-task.cpp), keep both in sync
-                             // the first evaluated token attends to the positions > pos_eval - n_swa, so a SWA state
-                             // starting at pos_eval - n_swa + 1 is enough, while a state without SWA must end before pos_eval
-                             const llama_pos pos_eval = pos_next - (has_new_tokens ? 0 : 1);
-@@ -4217,6 +4358,7 @@ private:
-                             // a state or a checkpoint is useful when its pos_min is below this threshold
-                             const auto pos_min_thold = std::max(0, n_swa > 0 ? pos_eval - n_swa + 2 : pos_eval);
- 
-+                            // mirrored by server_prompt_n_reusable (server-task.cpp), keep both in sync
-                             if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
-                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
-                                 if (pos_min == -1) {
-@@ -4268,6 +4410,7 @@ private:
-                                 }
- 
-                                 if (pos_min >= pos_min_thold) {
-+                                    // mirrored by server_prompt_n_reusable (server-task.cpp), keep both in sync
-                                     // search for a context checkpoint
-                                     const auto it = std::find_if(
-                                         slot.prompt.checkpoints.rbegin(),
-@@ -4280,10 +4423,12 @@ private:
-                                             if (cur.pos_max > pos_next) {
-                                                 return false;
-                                             }
-+                                            // mirrored by server_prompt_n_reusable (server-task.cpp), keep both in sync
-                                             return cur.pos_min < pos_min_thold || cur.pos_min == 0;
-                                         }
-                                     );
- 
-+                                    // mirrored by server_prompt_n_reusable (server-task.cpp), keep both in sync
-                                     bool do_reset = it == slot.prompt.checkpoints.rend();
- 
-                                     if (!do_reset) {
-@@ -4307,6 +4452,7 @@ private:
-                                         // restore the draft's speculative state
-                                         common_speculative_set_state(spec.get(), slot.id, cur.data_spec);
- 
-+                                        // mirrored by server_prompt_n_reusable (server-task.cpp), keep both in sync
-                                         pos_next = std::min(pos_next, std::max(cur.pos_min + 1, cur.pos_max));
-                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) cur.n_tokens);
-                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_past, (float) cur.size() / 1024 / 1024);
-@@ -4315,6 +4461,7 @@ private:
-                                     if (do_reset) {
-                                         SLT_TRC(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
-                                                 "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
-+                                        // mirrored by server_prompt_n_reusable (server-task.cpp), keep both in sync
-                                         pos_next = 0;
-                                         n_past = 0;
-                                     }
-@@ -4335,9 +4482,11 @@ private:
-                             }
-                         }
- 
-+                        // mirrored by server_prompt_n_reusable (server-task.cpp), keep both in sync
-                         // [TAG_PROMPT_LOGITS]
-                         if (n_past == slot.task->n_tokens() && n_past > 0) {
-                             SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
-+                            // mirrored by server_prompt_n_reusable (server-task.cpp), keep both in sync
-                             n_past--;
-                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
-                         }
-@@ -5226,6 +5375,8 @@ bool server_context::load_model(common_params & params) {
+@@ -5159,6 +5201,8 @@ bool server_context::load_model(common_params & params) {
  void server_context::start_loop() {
      auto & params = impl->params_base;
      impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
@@ -322,15 +134,21 @@ index 78c8ef149..7b7719afe 100644
  }
  
  void server_context::terminate() {
-diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
-index 4b2a8b2f7..82e3ce073 100644
---- a/tools/server/server-task.cpp
-+++ b/tools/server/server-task.cpp
-@@ -1,5 +1,15 @@
- #include "server-task.h"
- 
-+#include <cstdio>
+diff --git a/tools/server/server-prompt-disk.cpp b/tools/server/server-prompt-disk.cpp
+new file mode 100644
+index 000000000..03286781c
+--- /dev/null
++++ b/tools/server/server-prompt-disk.cpp
+@@ -0,0 +1,925 @@
++#include "server-prompt-disk.h"
++
++#include "build-info.h"
++#include "common.h"
++#include "llama.h"
++#include "log.h"
++
 +#include <algorithm>
++#include <cstdio>
 +#include <filesystem>
 +#include <fstream>
 +
@@ -339,27 +157,17 @@ index 4b2a8b2f7..82e3ce073 100644
 +#include <unistd.h>
 +#endif
 +
- #include "build-info.h"
- #include "server-chat.h"
- #include "chat.h"
-@@ -1733,6 +1743,811 @@ json server_task_result_apply_lora::to_json() {
- //
- // server_prompt_cache
- //
-+// ---- disk-backed prompt cache ----------------------------------------------
++// Only the state blobs move to disk: the token list, the lora config and the checkpoint positions
++// stay resident so choosing a state never needs to touch the disk.
 +//
-+// A state evicted for want of RAM is written to `dir` instead of being dropped, so a long
-+// conversation survives another prompt passing through the cache, and the whole cache is
-+// written out on shutdown so it survives a restart. Only the state blobs move: the token list
-+// and the checkpoint positions stay resident so choosing a state never needs to touch the disk.
-+//
-+// File layout: header, token list, target state, draft state, checkpoints (each a header and
-+// its data), then a trailer holding the payload size and an end marker. Files are written under
-+// a temporary name, synced and renamed, so a file with the final name is always complete.
++// File layout: header, token list, lora scales, target state, draft state, checkpoints (each a
++// header and its data), then a trailer holding the payload size and an end marker. Files are
++// written under a temporary name, synced and renamed, so a file with the final name is always
++// complete.
 +
 +static const uint32_t SERVER_PROMPT_CACHE_FILE_MAGIC   = 0x50435331; // "PCS1"
 +static const uint32_t SERVER_PROMPT_CACHE_FILE_END     = 0x45534350; // "PCSE"
-+static const uint32_t SERVER_PROMPT_CACHE_FILE_VERSION = 4;
++static const uint32_t SERVER_PROMPT_CACHE_FILE_VERSION = 5;
 +
 +static const size_t SERVER_PROMPT_CACHE_TRAILER_SIZE = sizeof(uint64_t) + sizeof(uint32_t);
 +
@@ -371,13 +179,14 @@ index 4b2a8b2f7..82e3ce073 100644
 +    uint64_t    fingerprint = 0;
 +    llama_pos   pos_min     = -1;
 +
-+    std::vector<char> tokens;
-+    common_state_data main;
-+    common_state_data drft;
++    std::vector<char>  tokens;
++    std::vector<float> lora;
++    common_state_data  main;
++    common_state_data  drft;
 +
 +    std::list<std::shared_ptr<const common_prompt_checkpoint>> checkpoints;
 +
-+    // guarded by the cache's writer_mutex
++    // guarded by writer_mutex
 +    bool done      = false;
 +    bool ok        = false;
 +    bool cancelled = false;
@@ -388,6 +197,7 @@ index 4b2a8b2f7..82e3ce073 100644
 +    uint32_t version;
 +    uint64_t fingerprint;
 +    uint64_t n_packed;
++    uint64_t n_lora;
 +    uint64_t n_main;
 +    uint64_t n_drft;
 +    uint64_t n_ckpt;
@@ -395,7 +205,7 @@ index 4b2a8b2f7..82e3ce073 100644
 +    int64_t  pos_min;
 +
 +    uint64_t payload() const {
-+        return n_packed + n_main + n_drft + n_ckpt_b;
++        return n_packed + n_lora*sizeof(float) + n_main + n_drft + n_ckpt_b;
 +    }
 +};
 +
@@ -408,17 +218,17 @@ index 4b2a8b2f7..82e3ce073 100644
 +    uint64_t size_spec;
 +};
 +
-+static_assert(sizeof(server_prompt_file_header) == 2*sizeof(uint32_t) + 7*sizeof(uint64_t), "padding in the file header");
++static_assert(sizeof(server_prompt_file_header) == 2*sizeof(uint32_t) + 8*sizeof(uint64_t), "padding in the file header");
 +static_assert(sizeof(server_prompt_file_ckpt)   == 6*sizeof(uint64_t),                      "padding in the checkpoint header");
 +
 +// checks the header against the file size and the trailer, which catches a file cut short
 +// by a crash or a full disk before anything is read from it
-+static const char * server_prompt_file_check(std::ifstream & file, const server_prompt_file_header & hdr, uint64_t size_file, uint64_t fingerprint) {
++static const char * server_prompt_file_check(std::ifstream & file, const server_prompt_file_header & hdr, uint64_t size_file, uint64_t fingerprint, size_t n_lora) {
 +    if (hdr.magic != SERVER_PROMPT_CACHE_FILE_MAGIC || hdr.version != SERVER_PROMPT_CACHE_FILE_VERSION) {
 +        return "not a state file of this version";
 +    }
 +
-+    if (hdr.fingerprint != fingerprint) {
++    if (hdr.fingerprint != fingerprint || hdr.n_lora != n_lora) {
 +        return "belongs to a different model or context";
 +    }
 +
@@ -454,7 +264,9 @@ index 4b2a8b2f7..82e3ce073 100644
 +        return false;
 +    }
 +
-+    return ckpt.size_tgt  <= hdr.n_ckpt_b &&
++    // a checkpoint without a target state would restore nothing, see common_prompt_checkpoint::load_tgt()
++    return ckpt.size_tgt  >  0 &&
++           ckpt.size_tgt  <= hdr.n_ckpt_b &&
 +           ckpt.size_dft  <= hdr.n_ckpt_b - ckpt.size_tgt &&
 +           ckpt.size_spec <= hdr.n_ckpt_b - ckpt.size_tgt - ckpt.size_dft;
 +}
@@ -478,6 +290,7 @@ index 4b2a8b2f7..82e3ce073 100644
 +    hdr.version     = SERVER_PROMPT_CACHE_FILE_VERSION;
 +    hdr.fingerprint = job.fingerprint;
 +    hdr.n_packed    = job.tokens.size();
++    hdr.n_lora      = job.lora.size();
 +    hdr.n_main      = job.main.size();
 +    hdr.n_drft      = job.drft.size();
 +    hdr.n_ckpt      = job.checkpoints.size();
@@ -493,6 +306,7 @@ index 4b2a8b2f7..82e3ce073 100644
 +
 +    put(&hdr,              sizeof(hdr));
 +    put(job.tokens.data(), job.tokens.size());
++    put(job.lora.data(),   job.lora.size()*sizeof(float));
 +    put(job.main.data(),   job.main.size());
 +    put(job.drft.data(),   job.drft.size());
 +
@@ -551,82 +365,170 @@ index 4b2a8b2f7..82e3ce073 100644
 +    return true;
 +}
 +
-+// the number of tokens of `tokens_new` that restoring a state can keep. On recurrent or SWA
-+// memory, a state whose pos_min is too far past the divergence can only be rewound by restoring
-+// a checkpoint at or before it.
-+// This mirrors the reuse rule in server_context::update_slots (server-context.cpp); the marker
-+// hunks of this patch next to that rule make `git apply` fail if upstream changes it.
-+static int server_prompt_n_reusable(
-+        const server_tokens & tokens,
-+        const std::vector<server_prompt_checkpoint_pos> & checkpoints,
-+        llama_pos pos_min,
-+        const server_tokens & tokens_new,
-+        bool needs_checkpoint,
-+        int32_t n_swa) {
-+    const int lcp = tokens.get_common_prefix(tokens_new);
-+
-+    const llama_pos pos_next      = tokens.pos_next(lcp);
-+    const bool      has_new       = lcp < (int) tokens_new.size();
-+    const llama_pos pos_eval      = pos_next - (has_new ? 0 : 1);
-+    const llama_pos pos_min_thold = std::max(0, n_swa > 0 ? pos_eval - n_swa + 2 : pos_eval);
-+
-+    // [TAG_PROMPT_LOGITS]
-+    const auto n_kept = [&](int n_past) {
-+        return n_past == (int) tokens_new.size() && n_past > 0 ? n_past - 1 : n_past;
-+    };
-+
-+    if (lcp == 0) {
-+        return 0;
-+    }
-+
-+    if (!needs_checkpoint || pos_min < pos_min_thold) {
-+        return n_kept(lcp);
-+    }
-+
-+    for (auto it = checkpoints.rbegin(); it != checkpoints.rend(); ++it) {
-+        if (it->pos_max > pos_next) {
-+            continue;
-+        }
-+
-+        if (it->pos_min >= pos_min_thold && it->pos_min != 0) {
-+            continue;
-+        }
-+
-+        const llama_pos pos_ckpt = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
-+
-+        return n_kept((int) std::min(tokens.size_up_to_pos(pos_ckpt), (size_t) it->n_tokens));
-+    }
-+
-+    return 0;
-+}
-+
-+static std::vector<server_prompt_checkpoint_pos> server_prompt_checkpoint_positions(const std::list<std::shared_ptr<const common_prompt_checkpoint>> & checkpoints) {
-+    std::vector<server_prompt_checkpoint_pos> res;
-+    res.reserve(checkpoints.size());
-+
-+    for (const auto & ckpt : checkpoints) {
-+        res.push_back({ ckpt->n_tokens, ckpt->pos_min, ckpt->pos_max });
-+    }
++// a checkpoint without its data, which is enough for server_prompt::get_reuse(). it never leaves
++// server_prompt_disk: read_file() gives the slot the checkpoints with their data
++static std::shared_ptr<const common_prompt_checkpoint> server_prompt_ckpt_stub(int64_t n_tokens, llama_pos pos_min, llama_pos pos_max) {
++    auto res = std::make_shared<common_prompt_checkpoint>();
++    res->n_tokens = n_tokens;
++    res->pos_min  = pos_min;
++    res->pos_max  = pos_max;
 +
 +    return res;
 +}
 +
-+int server_prompt_cache::n_reusable(const server_prompt_cache_state & state, const server_tokens & tokens_new) const {
-+    if (state.on_disk()) {
-+        return server_prompt_n_reusable(state.prompt.tokens, state.checkpoints_disk, state.pos_min, tokens_new, needs_checkpoint, n_swa);
++//
++// server_prompt_cache, the parts that drive the disk tier
++//
++
++void server_prompt_cache::init_disk(const common_params & params, int32_t n_ctx, const llama_context * ctx, bool has_draft, bool has_mtmd, int32_t n_swa) {
++    // the state blobs are only meaningful for this exact model and context layout
++    // a file is identified by its path, size and modification time, so replacing a
++    // model file in place invalidates the states computed with the old one
++    const auto file_id = [](const std::string & path) -> std::string {
++        if (path.empty()) {
++            return "-";
++        }
++        std::error_code ec;
++        const auto size  = std::filesystem::file_size(path, ec);
++        const auto mtime = std::filesystem::last_write_time(path, ec);
++        return path + ":" + std::to_string(size) + ":" +
++            std::to_string((long long) mtime.time_since_epoch().count());
++    };
++
++    const auto & draft = params.speculative.draft;
++
++    // the build too: the state layout can change between versions with the same sizes
++    std::string sig =
++        std::string(llama_build_info()) + "|" +
++        file_id(params.model.path) + "|" +
++        file_id(draft.mparams.path) + "|" +
++        file_id(params.mmproj.path) + "|" +
++        std::to_string(n_ctx) + "|" +
++        std::to_string(params.n_parallel) + "|" +
++        std::to_string(params.kv_unified) + "|" +
++        std::to_string(params.kv_unified_per_slot) + "|" +
++        std::to_string(params.swa_full) + "|" +
++        std::to_string((int) params.flash_attn_type) + "|" +
++        std::to_string((int) params.cache_type_k) + "|" +
++        std::to_string((int) params.cache_type_v) + "|" +
++        std::to_string((int) draft.cache_type_k) + "|" +
++        std::to_string((int) draft.cache_type_v) + "|" +
++        std::to_string(has_draft) + "|" +
++        std::to_string(params.rope_freq_base) + "|" +
++        std::to_string(params.rope_freq_scale) + "|" +
++        std::to_string(params.yarn_ext_factor) + "|" +
++        std::to_string(params.yarn_attn_factor) + "|" +
++        std::to_string(params.yarn_beta_fast) + "|" +
++        std::to_string(params.yarn_beta_slow) + "|" +
++        std::to_string(params.yarn_orig_ctx);
++
++    for (const auto & la : params.lora_adapters) {
++        sig += "|lora:" + file_id(la.path) + ":" + std::to_string(la.scale);
 +    }
 +
-+    return server_prompt_n_reusable(state.prompt.tokens, server_prompt_checkpoint_positions(state.prompt.checkpoints),
-+            state.pos_min, tokens_new, needs_checkpoint, n_swa);
++    for (const auto & cv : params.control_vectors) {
++        sig += "|cvec:" + file_id(cv.fname) + ":" + std::to_string(cv.strength);
++    }
++    sig += "|" + std::to_string(params.control_vector_layer_start) + ":" +
++        std::to_string(params.control_vector_layer_end);
++
++    for (const auto & kvo : params.kv_overrides) {
++        if (kvo.key[0] == 0) {
++            continue;
++        }
++        sig += "|kv:" + std::string(kvo.key) + "=" + std::to_string((int) kvo.tag) + ":";
++        switch (kvo.tag) {
++            case LLAMA_KV_OVERRIDE_TYPE_INT:   sig += std::to_string(kvo.val_i64);  break;
++            case LLAMA_KV_OVERRIDE_TYPE_FLOAT: sig += std::to_string(kvo.val_f64);  break;
++            case LLAMA_KV_OVERRIDE_TYPE_BOOL:  sig += std::to_string(kvo.val_bool); break;
++            case LLAMA_KV_OVERRIDE_TYPE_STR:   sig += std::string(kvo.val_str);     break;
++        }
++    }
++
++    uint64_t fingerprint = 0xcbf29ce484222325ull;
++    for (const char c : sig) {
++        fingerprint = (fingerprint ^ (uint8_t) c) * 0x100000001b3ull;
++    }
++
++    disk = std::make_shared<server_prompt_disk>();
++
++    disk->dir         = params.cache_dir;
++    disk->limit_size  = params.cache_disk_mib < 0 ? 0 : 1024ull*1024ull*params.cache_disk_mib;
++    disk->fingerprint = fingerprint;
++    disk->has_mtmd    = has_mtmd;
++    disk->n_swa       = n_swa;
++    disk->lora_base   = params.lora_adapters;
++
++    const size_t n_adopted = disk->index(ctx);
++    if (n_adopted > 0) {
++        SRV_WRN("adopted %zu prompt cache state(s) from an earlier run (%.3f MiB)\n",
++                n_adopted, disk->size() / (1024.0 * 1024.0));
++    }
++
++    SRV_TRC("prompt cache spills to '%s', disk limit: %s\n", disk->dir.c_str(),
++            params.cache_disk_mib < 0 ? "no limit" : (std::to_string(params.cache_disk_mib) + " MiB").c_str());
 +}
 +
-+void server_prompt_cache::writer_start() {
++void server_prompt_cache::flush_disk() {
++    if (!disk) {
++        return;
++    }
++
++    const int64_t t_start_us = ggml_time_us();
++
++    const size_t n_states = states.size();
++
++    while (!states.empty()) {
++        disk->put(std::move(states.front()));
++        states.pop_front();
++    }
++
++    disk->flush();
++
++    if (n_states > 0) {
++        SRV_WRN("prompt cache: wrote %zu state(s) to disk, %zu on disk, %.3f MiB, %.2f ms\n",
++                n_states, disk->entries.size(), disk->size() / (1024.0 * 1024.0), (ggml_time_us() - t_start_us) / 1000.0);
++    }
++}
++
++//
++// server_prompt_disk
++//
++
++server_prompt_disk::~server_prompt_disk() {
++    {
++        std::unique_lock<std::mutex> lock(writer_mutex);
++        writer_stop = true;
++    }
++    writer_cv.notify_all();
++
++    // the writer finishes the queued files first
++    if (writer.joinable()) {
++        writer.join();
++    }
++}
++
++// the tokens update_slots() would keep if this prompt were the slot's: on recurrent or SWA memory, a
++// state whose pos_min is too far past the divergence can only be rewound by restoring a checkpoint
++int server_prompt_disk::n_reusable(const server_prompt & prompt, llama_pos pos_min, const server_tokens & tokens_new) const {
++    const int n_prefix = prompt.tokens.get_common_prefix(tokens_new);
++    if (n_prefix == 0) {
++        return 0;
++    }
++
++    const int n_past = prompt.get_reuse(n_prefix, n_prefix < (int) tokens_new.size(), n_swa, pos_min).n_past;
++
++    // at least one token is evaluated [TAG_PROMPT_LOGITS]
++    return std::min(n_past, (int) tokens_new.size() - 1);
++}
++
++void server_prompt_disk::writer_start() {
 +    if (!writer.joinable()) {
 +        writer = std::thread([this]() { writer_loop(); });
 +    }
 +}
 +
-+void server_prompt_cache::writer_loop() {
++void server_prompt_disk::writer_loop() {
 +    while (true) {
 +        std::shared_ptr<server_prompt_spill_job> job;
 +
@@ -671,6 +573,7 @@ index 4b2a8b2f7..82e3ce073 100644
 +
 +            // the file holds it now
 +            job->tokens = {};
++            job->lora   = {};
 +            job->main   = {};
 +            job->drft   = {};
 +            job->checkpoints.clear();
@@ -680,7 +583,7 @@ index 4b2a8b2f7..82e3ce073 100644
 +    }
 +}
 +
-+void server_prompt_cache::writer_wait(const std::shared_ptr<server_prompt_spill_job> & job) {
++void server_prompt_disk::writer_wait(const std::shared_ptr<server_prompt_spill_job> & job) {
 +    std::unique_lock<std::mutex> lock(writer_mutex);
 +    writer_cv_done.wait(lock, [&job]() { return job->done; });
 +}
@@ -689,11 +592,7 @@ index 4b2a8b2f7..82e3ce073 100644
 +// so adopt them instead of decoding those prompts again. Anything foreign or unreadable is
 +// deleted: a crash skips the shutdown flush, and the directory must not grow without bound.
 +// The directory must belong to a single server for this reason.
-+size_t server_prompt_cache::index_dir(const llama_context * ctx) {
-+    if (dir.empty()) {
-+        return 0;
-+    }
-+
++size_t server_prompt_disk::index(const llama_context * ctx) {
 +    struct found_file {
 +        std::filesystem::file_time_type mtime;
 +        size_t      idx;
@@ -748,7 +647,7 @@ index 4b2a8b2f7..82e3ce073 100644
 +        return a.mtime != b.mtime ? a.mtime > b.mtime : a.idx > b.idx;
 +    });
 +
-+    std::vector<server_prompt_cache_state> adopted;
++    std::vector<server_prompt_disk_entry> adopted;
 +    size_t size_adopted = 0;
 +
 +    for (const auto & f : found) {
@@ -774,12 +673,12 @@ index 4b2a8b2f7..82e3ce073 100644
 +            continue;
 +        }
 +
-+        if (const char * err = server_prompt_file_check(file, hdr, size_file, fingerprint)) {
++        if (const char * err = server_prompt_file_check(file, hdr, size_file, fingerprint, lora_base.size())) {
 +            discard(err);
 +            continue;
 +        }
 +
-+        if (limit_size_disk > 0 && size_adopted + size_file > limit_size_disk) {
++        if (limit_size > 0 && size_adopted + size_file > limit_size) {
 +            discard("does not fit the prompt cache disk limit");
 +            continue;
 +        }
@@ -787,10 +686,17 @@ index 4b2a8b2f7..82e3ce073 100644
 +        llama_tokens packed(hdr.n_packed / sizeof(llama_token));
 +        file.read(reinterpret_cast<char *>(packed.data()), (std::streamsize) hdr.n_packed);
 +
++        server_prompt prompt_cur;
++
++        // the adapters are the server's, the fingerprint covers them; only the scales vary
++        prompt_cur.lora = lora_base;
++        for (auto & la : prompt_cur.lora) {
++            file.read(reinterpret_cast<char *>(&la.scale), sizeof(la.scale));
++        }
++
 +        file.seekg((std::streamoff) (hdr.n_main + hdr.n_drft), std::ios::cur);
 +
 +        // the checkpoint positions only, the data stays in the file
-+        std::vector<server_prompt_checkpoint_pos> ckpts;
 +        for (uint64_t i = 0; i < hdr.n_ckpt && file; ++i) {
 +            server_prompt_file_ckpt ckpt;
 +            if (!server_prompt_file_read_ckpt(file, hdr, ckpt)) {
@@ -798,7 +704,7 @@ index 4b2a8b2f7..82e3ce073 100644
 +                break;
 +            }
 +
-+            ckpts.push_back({ ckpt.n_tokens, (llama_pos) ckpt.pos_min, (llama_pos) ckpt.pos_max });
++            prompt_cur.checkpoints.push_back(server_prompt_ckpt_stub(ckpt.n_tokens, (llama_pos) ckpt.pos_min, (llama_pos) ckpt.pos_max));
 +
 +            file.seekg((std::streamoff) (ckpt.size_tgt + ckpt.size_dft + ckpt.size_spec), std::ios::cur);
 +        }
@@ -808,7 +714,6 @@ index 4b2a8b2f7..82e3ce073 100644
 +            continue;
 +        }
 +
-+        server_prompt prompt_cur;
 +        try {
 +            prompt_cur.tokens = server_tokens::deserialize(packed, has_mtmd);
 +        } catch (const std::exception & err) {
@@ -822,68 +727,37 @@ index 4b2a8b2f7..82e3ce073 100644
 +            continue;
 +        }
 +
-+        server_prompt_cache_state state;
-+        state.prompt           = std::move(prompt_cur);
-+        state.pos_min          = (llama_pos) hdr.pos_min;
-+        state.path             = path_cur;
-+        state.size_disk        = size_file;
-+        state.checkpoints_disk = std::move(ckpts);
++        server_prompt_disk_entry entry;
++        entry.prompt  = std::move(prompt_cur);
++        entry.pos_min = (llama_pos) hdr.pos_min;
++        entry.path    = path_cur;
++        entry.size    = size_file;
 +
-+        adopted.push_back(std::move(state));
++        adopted.push_back(std::move(entry));
 +        size_adopted += size_file;
 +    }
 +
 +    // the list is least recently used first
 +    for (auto it = adopted.rbegin(); it != adopted.rend(); ++it) {
-+        states.push_back(std::move(*it));
++        entries.push_back(std::move(*it));
 +    }
 +
 +    return adopted.size();
 +}
 +
-+void server_prompt_cache::flush() {
-+    if (dir.empty()) {
-+        return;
++void server_prompt_disk::put(server_prompt_cache_state && state) {
++    // finish the writes the writer is done with
++    for (auto it = entries.begin(); it != entries.end(); ) {
++        it = it->job ? reap(it, false) : std::next(it);
 +    }
 +
-+    const int64_t t_start_us = ggml_time_us();
-+
-+    size_t n_spilled = 0;
-+
-+    for (auto & state : states) {
-+        if (!state.on_disk() && spill(state)) {
-+            n_spilled++;
++    // a state on disk holds it already
++    for (const auto & entry : entries) {
++        if ((size_t) entry.prompt.tokens.get_common_prefix(state.prompt.tokens) == state.prompt.tokens.size() &&
++            are_lora_equal(entry.prompt.lora, state.prompt.lora)) {
++            SRV_TRC(" - prompt with length %d is already on disk, skipping\n", state.prompt.n_tokens());
++            return;
 +        }
-+    }
-+
-+    for (auto it = states.begin(); it != states.end(); ) {
-+        it = it->job ? reap(it, true) : std::next(it);
-+    }
-+
-+    if (n_spilled > 0) {
-+        SRV_WRN("prompt cache: wrote %zu state(s) to disk, %zu on disk, %.3f MiB, %.2f ms\n",
-+                n_spilled, states.size(), size_disk() / (1024.0 * 1024.0), (ggml_time_us() - t_start_us) / 1000.0);
-+    }
-+}
-+
-+server_prompt_cache::~server_prompt_cache() {
-+    // normally already flushed when the server loop ended; this catches any other exit path
-+    flush();
-+
-+    {
-+        std::unique_lock<std::mutex> lock(writer_mutex);
-+        writer_stop = true;
-+    }
-+    writer_cv.notify_all();
-+
-+    if (writer.joinable()) {
-+        writer.join();
-+    }
-+}
-+
-+bool server_prompt_cache::spill(server_prompt_cache_state & state) {
-+    if (dir.empty() || state.on_disk()) {
-+        return false;
 +    }
 +
 +    auto job = std::make_shared<server_prompt_spill_job>();
@@ -892,7 +766,11 @@ index 4b2a8b2f7..82e3ce073 100644
 +        job->tokens = state.prompt.tokens.serialize();
 +    } catch (const std::exception & err) {
 +        SRV_WRN(" - cannot serialize tokens for the prompt cache file: %s\n", err.what());
-+        return false;
++        return;
++    }
++
++    for (const auto & la : state.prompt.lora) {
++        job->lora.push_back(la.scale);
 +    }
 +
 +    size_t size_ckpt = 0;
@@ -900,39 +778,38 @@ index 4b2a8b2f7..82e3ce073 100644
 +        size_ckpt += sizeof(server_prompt_file_ckpt) + ckpt->data_tgt.size() + ckpt->data_dft.size() + ckpt->data_spec.size();
 +    }
 +
-+    const size_t size_file = sizeof(server_prompt_file_header) + job->tokens.size() +
++    const size_t size_file = sizeof(server_prompt_file_header) + job->tokens.size() + job->lora.size()*sizeof(float) +
 +        state.data.main.size() + state.data.drft.size() + size_ckpt + SERVER_PROMPT_CACHE_TRAILER_SIZE;
 +
 +    // checked before making room, so a state that cannot be stored never evicts the others
-+    if (limit_size_disk > 0 && size_file > limit_size_disk) {
++    if (limit_size > 0 && size_file > limit_size) {
 +        SRV_WRN(" - prompt state %.3f MiB does not fit the prompt cache disk limit %.3f MiB\n",
-+                size_file / (1024.0 * 1024.0), limit_size_disk / (1024.0 * 1024.0));
-+        return false;
++                size_file / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
++        return;
 +    }
 +
-+    // files still being written count against the free space too, the ones make_room_disk() is
++    // files still being written count against the free space too, the ones make_room() is
 +    // about to delete do not
 +    size_t size_pending = 0;
 +    {
 +        std::unique_lock<std::mutex> lock(writer_mutex);
-+        for (const auto & cur : states) {
++        for (const auto & cur : entries) {
 +            if (cur.job && !cur.job->done) {
-+                size_pending += cur.size_disk;
++                size_pending += cur.size;
 +            }
 +        }
 +    }
 +
-+    const size_t size_freed = limit_size_disk > 0 && size_disk() + size_file > limit_size_disk ?
-+        size_disk() + size_file - limit_size_disk : 0;
++    const size_t size_freed = limit_size > 0 && size() + size_file > limit_size ? size() + size_file - limit_size : 0;
 +
 +    std::error_code ec;
 +    const auto space = std::filesystem::space(dir, ec);
 +    if (ec || space.available + size_freed < size_file + size_pending + SERVER_PROMPT_CACHE_DISK_RESERVE) {
 +        SRV_WRN(" - not enough free space in '%s' for a %.3f MiB prompt state\n", dir.c_str(), size_file / (1024.0 * 1024.0));
-+        return false;
++        return;
 +    }
 +
-+    make_room_disk(size_file);
++    make_room(size_file);
 +
 +    job->path        = (std::filesystem::path(dir) / ("state-" + std::to_string(i_file++) + ".bin")).string();
 +    job->fingerprint = fingerprint;
@@ -941,17 +818,21 @@ index 4b2a8b2f7..82e3ce073 100644
 +    job->drft        = std::move(state.data.drft);
 +    job->checkpoints = std::move(state.prompt.checkpoints);
 +
-+    state.data.main = {};
-+    state.data.drft = {};
-+    state.prompt.checkpoints.clear();
-+
-+    state.checkpoints_disk = server_prompt_checkpoint_positions(job->checkpoints);
-+    state.path             = job->path;
-+    state.size_disk        = size_file;
-+    state.job              = job;
++    server_prompt_disk_entry entry;
++    entry.prompt.tokens = std::move(state.prompt.tokens);
++    entry.prompt.lora   = std::move(state.prompt.lora);
++    for (const auto & ckpt : job->checkpoints) {
++        entry.prompt.checkpoints.push_back(server_prompt_ckpt_stub(ckpt->n_tokens, ckpt->pos_min, ckpt->pos_max));
++    }
++    entry.pos_min = state.pos_min;
++    entry.path    = job->path;
++    entry.size    = size_file;
++    entry.job     = job;
 +
 +    SRV_WRN(" - spilling prompt cache entry to disk (%d tokens, %zu checkpoints, %.3f MiB)\n",
-+            state.prompt.n_tokens(), state.checkpoints_disk.size(), size_file / (1024.0 * 1024.0));
++            entry.prompt.n_tokens(), entry.prompt.checkpoints.size(), size_file / (1024.0 * 1024.0));
++
++    entries.push_back(std::move(entry));
 +
 +    writer_start();
 +
@@ -960,47 +841,101 @@ index 4b2a8b2f7..82e3ce073 100644
 +        writer_queue.push_back(job);
 +    }
 +    writer_cv.notify_one();
++}
++
++bool server_prompt_disk::load(std::list<server_prompt_cache_state> & states, std::list<server_prompt_cache_state>::const_iterator pick,
++        const server_prompt * prompt, llama_pos pos_min, const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new) {
++    // the RAM candidate wins a tie, it does not have to be read back
++    int n_best = prompt ? n_reusable(*prompt, pos_min, tokens_new) : 0;
++    if (pick != states.end()) {
++        n_best = std::max(n_best, n_reusable(pick->prompt, pick->pos_min, tokens_new));
++    }
++
++    auto it_best = entries.end();
++
++    for (auto it = entries.begin(); it != entries.end(); ++it) {
++        if (lora_should_clear_cache(it->prompt.lora, lora_new)) {
++            continue;
++        }
++
++        const int n_cur = n_reusable(it->prompt, it->pos_min, tokens_new);
++
++        SRV_TRC("   - prompt with length %7zu on disk, reusable = %7d\n", it->prompt.tokens.size(), n_cur);
++
++        if (n_cur > n_best) {
++            n_best  = n_cur;
++            it_best = it;
++        }
++    }
++
++    if (it_best == entries.end()) {
++        return false;
++    }
++
++    const int64_t t_start_us = ggml_time_us();
++
++    server_prompt_cache_state state;
++    if (!read_file(*it_best, state)) {
++        SRV_WRN("%s", " - failed to read the spilled prompt state, dropping it\n");
++
++        drop(it_best);
++
++        return false;
++    }
++
++    SRV_WRN(" - read a prompt state from disk (%d tokens, %zu checkpoints, %.3f MiB, %.2f ms)\n",
++            state.prompt.n_tokens(), state.prompt.checkpoints.size(), it_best->size / (1024.0 * 1024.0),
++            (ggml_time_us() - t_start_us) / 1000.0);
++
++    states.push_back(std::move(state));
++
++    // the file stays: a later prompt may branch from the same point, and a crash before
++    // this slot is saved again must not lose it. Mark it most recently used.
++    entries.splice(entries.end(), entries, it_best);
 +
 +    return true;
 +}
 +
-+bool server_prompt_cache::read_file(server_prompt_cache_state & state) {
-+    if (state.job) {
-+        writer_wait(state.job);
++bool server_prompt_disk::read_file(const server_prompt_disk_entry & entry, server_prompt_cache_state & state) {
++    if (entry.job) {
++        writer_wait(entry.job);
 +
-+        if (!state.job->ok) {
++        if (!entry.job->ok) {
 +            return false;
 +        }
 +    }
 +
 +    std::error_code ec;
-+    const uint64_t size_file = std::filesystem::file_size(state.path, ec);
++    const uint64_t size_file = std::filesystem::file_size(entry.path, ec);
 +
-+    std::ifstream file(state.path, std::ios::binary);
++    std::ifstream file(entry.path, std::ios::binary);
 +    if (!file || ec) {
-+        SRV_WRN(" - cannot open prompt cache file '%s' for reading\n", state.path.c_str());
++        SRV_WRN(" - cannot open prompt cache file '%s' for reading\n", entry.path.c_str());
 +        return false;
 +    }
 +
 +    server_prompt_file_header hdr;
 +    if (!file.read(reinterpret_cast<char *>(&hdr), sizeof(hdr))) {
-+        SRV_WRN(" - prompt cache file '%s' is truncated\n", state.path.c_str());
++        SRV_WRN(" - prompt cache file '%s' is truncated\n", entry.path.c_str());
 +        return false;
 +    }
 +
-+    if (const char * err = server_prompt_file_check(file, hdr, size_file, fingerprint)) {
-+        SRV_WRN(" - prompt cache file '%s' %s\n", state.path.c_str(), err);
++    if (const char * err = server_prompt_file_check(file, hdr, size_file, fingerprint, lora_base.size())) {
++        SRV_WRN(" - prompt cache file '%s' %s\n", entry.path.c_str(), err);
 +        return false;
 +    }
 +
-+    auto & data = state.data;
++    state.prompt.tokens = entry.prompt.tokens.clone();
++    state.prompt.lora   = entry.prompt.lora;
++    state.pos_min       = entry.pos_min;
 +
-+    data.main.resize(hdr.n_main);
-+    data.drft.resize(hdr.n_drft);
++    state.data.main.resize(hdr.n_main);
++    state.data.drft.resize(hdr.n_drft);
 +
-+    file.seekg((std::streamoff) hdr.n_packed, std::ios::cur);
-+    file.read(reinterpret_cast<char *>(data.main.data()), (std::streamsize) hdr.n_main);
-+    file.read(reinterpret_cast<char *>(data.drft.data()), (std::streamsize) hdr.n_drft);
++    // the token list and the lora config are resident
++    file.seekg((std::streamoff) (hdr.n_packed + hdr.n_lora*sizeof(float)), std::ios::cur);
++    file.read(reinterpret_cast<char *>(state.data.main.data()), (std::streamsize) hdr.n_main);
++    file.read(reinterpret_cast<char *>(state.data.drft.data()), (std::streamsize) hdr.n_drft);
 +
 +    for (uint64_t i = 0; i < hdr.n_ckpt && file; ++i) {
 +        server_prompt_file_ckpt ckpt_hdr;
@@ -1028,19 +963,18 @@ index 4b2a8b2f7..82e3ce073 100644
 +    }
 +
 +    if (!file) {
-+        SRV_WRN(" - prompt cache file '%s' is truncated\n", state.path.c_str());
-+        state.release();
++        SRV_WRN(" - prompt cache file '%s' is truncated\n", entry.path.c_str());
 +        return false;
 +    }
 +
 +    // most recently used, for the next run's adoption order
-+    std::filesystem::last_write_time(state.path, std::filesystem::file_time_type::clock::now(), ec);
++    std::filesystem::last_write_time(entry.path, std::filesystem::file_time_type::clock::now(), ec);
 +
 +    return true;
 +}
 +
-+std::list<server_prompt_cache_state>::iterator server_prompt_cache::drop(std::list<server_prompt_cache_state>::iterator it) {
-+    bool remove_now = it->on_disk();
++std::list<server_prompt_disk_entry>::iterator server_prompt_disk::drop(std::list<server_prompt_disk_entry>::iterator it) {
++    bool remove_now = true;
 +
 +    if (it->job) {
 +        std::unique_lock<std::mutex> lock(writer_mutex);
@@ -1058,10 +992,10 @@ index 4b2a8b2f7..82e3ce073 100644
 +        std::remove(it->path.c_str());
 +    }
 +
-+    return states.erase(it);
++    return entries.erase(it);
 +}
 +
-+std::list<server_prompt_cache_state>::iterator server_prompt_cache::reap(std::list<server_prompt_cache_state>::iterator it, bool wait) {
++std::list<server_prompt_disk_entry>::iterator server_prompt_disk::reap(std::list<server_prompt_disk_entry>::iterator it, bool wait) {
 +    bool done = false;
 +    bool ok   = false;
 +    {
@@ -1084,13 +1018,14 @@ index 4b2a8b2f7..82e3ce073 100644
 +
 +    it->job.reset();
 +
-+    // the states on disk this one contains were kept until its file was complete, so a crash
++    // the entries this one contains were kept until its file was complete, so a crash
 +    // in between does not lose both
-+    for (auto cur = states.begin(); cur != states.end(); ) {
++    for (auto cur = entries.begin(); cur != entries.end(); ) {
 +        const size_t len = cur->prompt.tokens.size();
 +
-+        if (cur != it && cur->on_disk() && len < it->prompt.tokens.size() &&
-+            (size_t) cur->prompt.tokens.get_common_prefix(it->prompt.tokens) == len) {
++        if (cur != it && len < it->prompt.tokens.size() &&
++            (size_t) cur->prompt.tokens.get_common_prefix(it->prompt.tokens) == len &&
++            are_lora_equal(cur->prompt.lora, it->prompt.lora)) {
 +            SRV_TRC(" - removing obsolete cached prompt with length %zu\n", len);
 +
 +            cur = drop(cur);
@@ -1102,442 +1037,134 @@ index 4b2a8b2f7..82e3ce073 100644
 +    return std::next(it);
 +}
 +
-+void server_prompt_cache::evict(const char * reason, const std::function<bool()> & over) {
-+    for (auto it = states.begin(); it != states.end() && over(); ) {
-+        if (it->on_disk()) {
-+            ++it;
-+            continue;
-+        }
-+
-+        const double size_mib = it->size() / (1024.0 * 1024.0);
-+
-+        // prefer moving the state out to disk: reading it back beats decoding the prompt again
-+        if (spill(*it)) {
-+            ++it;
-+            continue;
-+        }
-+
-+        SRV_WRN(" - %s, removing oldest entry (size = %.3f MiB)\n", reason, size_mib);
-+
-+        it = drop(it);
++void server_prompt_disk::flush() {
++    for (auto it = entries.begin(); it != entries.end(); ) {
++        it = it->job ? reap(it, true) : std::next(it);
 +    }
 +}
 +
-+void server_prompt_cache::make_room_disk(size_t need) {
-+    if (limit_size_disk == 0) {
++void server_prompt_disk::make_room(size_t need) {
++    if (limit_size == 0) {
 +        return;
 +    }
 +
-+    for (auto it = states.begin(); it != states.end() && size_disk() + need > limit_size_disk; ) {
-+        if (!it->on_disk()) {
-+            ++it;
-+            continue;
-+        }
-+
++    for (auto it = entries.begin(); it != entries.end() && size() + need > limit_size; ) {
 +        SRV_WRN(" - prompt cache disk limit reached, removing least recently used entry (size = %.3f MiB)\n",
-+                it->size_disk / (1024.0 * 1024.0));
++                it->size / (1024.0 * 1024.0));
 +
 +        it = drop(it);
 +    }
 +}
 +
-+size_t server_prompt_cache::size_disk() const {
++size_t server_prompt_disk::size() const {
 +    size_t res = 0;
 +
-+    for (const auto & state : states) {
-+        res += state.size_disk;
++    for (const auto & entry : entries) {
++        res += entry.size;
 +    }
 +
 +    return res;
 +}
+diff --git a/tools/server/server-prompt-disk.h b/tools/server/server-prompt-disk.h
+new file mode 100644
+index 000000000..1d31eb6c9
+--- /dev/null
++++ b/tools/server/server-prompt-disk.h
+@@ -0,0 +1,107 @@
++#pragma once
 +
- size_t server_prompt_cache::size() const {
-     size_t res = 0;
- 
-@@ -1747,6 +2562,10 @@ size_t server_prompt_cache::n_tokens() const {
-     size_t res = 0;
- 
-     for (const auto & state : states) {
-+        if (state.on_disk()) {
-+            continue;
-+        }
++#include "server-slot-sched.h"
 +
-         res += state.prompt.n_tokens();
-     }
- 
-@@ -1772,18 +2591,20 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
- 
-     const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
- 
--    // skip over-limit entries to avoid disturbing the cache
--    if (limit_size > 0 && state_size_new > limit_size) {
-+    // skip over-limit entries to avoid disturbing the cache. With a cache directory the entry
-+    // is still taken: update() moves it straight to disk.
-+    if (limit_size > 0 && state_size_new > limit_size && dir.empty()) {
-         SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
-                 state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
-         return nullptr;
-     }
- 
-     // remove any cached prompts that are fully contained in the current prompt
-+    // one on disk stays until the new state is on disk too, see reap()
-     for (auto it = states.begin(); it != states.end();) {
-         const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
- 
--        if (len == (int) it->prompt.tokens.size()) {
-+        if (len == (int) it->prompt.tokens.size() && !it->on_disk()) {
-             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
- 
-             it = states.erase(it);
-@@ -1794,12 +2615,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
- 
-     if (limit_size > 0) {
-         // make room before allocating the new vectors to avoid breaching the limit
--        while (!states.empty() && size() + state_size_new > limit_size) {
--            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
--                    states.front().size() / (1024.0 * 1024.0));
--
--            states.pop_front();
--        }
-+        evict("making room for prompt cache entry", [&]() { return size() + state_size_new > limit_size; });
-     }
- 
-     common_state_data state_data_tgt;
-@@ -1821,16 +2637,17 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
-         return nullptr;
-     }
- 
--    states.push_back({
--        /*.prompt =*/ {
--            /*.tokens      =*/ prompt.tokens.clone(),
--            /*.checkpoints =*/ prompt.checkpoints,
--        },
--        /*.data   =*/ {
--            /*.main =*/ std::move(state_data_tgt),
--            /*.drft =*/ std::move(state_data_dft),
--        },
--    });
-+    server_prompt_cache_state state;
-+    state.prompt = {
-+        /*.tokens      =*/ prompt.tokens.clone(),
-+        /*.checkpoints =*/ prompt.checkpoints,
-+    };
-+    state.data = {
-+        /*.main =*/ std::move(state_data_tgt),
-+        /*.drft =*/ std::move(state_data_dft),
-+    };
-+
-+    states.push_back(std::move(state));
- 
-     return &states.back();
- }
-@@ -1838,38 +2655,52 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
- bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
-     int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
- 
--    float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
--    float f_sim_best  = float(lcp_best) / tokens_new.size();
-+    const int n_base = server_prompt_n_reusable(prompt.tokens, server_prompt_checkpoint_positions(prompt.checkpoints),
-+            llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), id_slot), tokens_new, needs_checkpoint, n_swa);
- 
--    SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
-+    SRV_TRC(" - looking for better prompt, base lcp = %d, reusable = %d\n", lcp_best, n_base);
- 
-     auto it_best = states.end();
-+    int  n_best  = n_base;
- 
--    // find the most similar cached prompt, that would also preserve the most context
-+    // find the cached prompt that keeps the most of the new prompt without decoding it again
-     for (auto it = states.begin(); it != states.end(); ++it) {
-         const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
-+        const int n_cur   = n_reusable(*it, tokens_new);
- 
-         const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
--        const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
- 
--        SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
-+        SRV_TRC("   - prompt with length %7zu, lcp = %7d, reusable = %7d, f_keep = %.3f%s\n",
-+                it->prompt.tokens.size(), lcp_cur, n_cur, f_keep_cur, it->on_disk() ? " (disk)" : "");
- 
--        // don't trash large prompts
--        if (f_keep_cur < 0.25f) {
-+        // don't trash large prompts: a resident state is consumed when it is restored,
-+        // a state on disk stays there
-+        if (!it->on_disk() && f_keep_cur < 0.25f) {
-             continue;
-         }
- 
--        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
--            f_keep_best = f_keep_cur;
--            f_sim_best  = f_sim_cur;
--            lcp_best    = lcp_cur;
-+        // prefer the resident one when equal, it does not have to be read back
-+        if (n_cur > n_best || (n_cur == n_best && it_best != states.end() && it_best->on_disk() && !it->on_disk())) {
-+            n_best   = n_cur;
-+            lcp_best = lcp_cur;
- 
-             it_best = it;
-         }
-     }
- 
-+    const int64_t t_start_us = ggml_time_us();
-+
-+    // a spilled state that cannot be read back is dropped, and the slot keeps its own prompt
-+    if (it_best != states.end() && it_best->on_disk() && !read_file(*it_best)) {
-+        SRV_WRN("%s", " - failed to read the spilled prompt state, dropping it\n");
-+
-+        drop(it_best);
-+
-+        it_best = states.end();
-+    }
-+
-     if (it_best != states.end()) {
--        SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
-+        SRV_TRC(" - found better prompt, reusable = %d\n", n_best);
- 
-         {
-             auto & data = it_best->data.main;
-@@ -1879,9 +2710,17 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
-             if (n != size) {
-                 SRV_ERR("failed to restore state with size %zu\n", size);
- 
-+                it_best->release();
-+
-                 return false;
-             }
- 
-+            // the reuse prediction assumed this position
-+            const llama_pos pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), id_slot);
-+            if (pos_min != it_best->pos_min) {
-+                SRV_WRN(" - restored state has pos_min = %d, expected %d\n", pos_min, it_best->pos_min);
-+            }
-+
-             data.clear();
-             data.shrink_to_fit();
-         }
-@@ -1897,6 +2736,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
-                 if (n != size) {
-                     SRV_WRN("failed to restore state with size %zu\n", size);
- 
-+                    it_best->release();
-+
-                     return false;
-                 }
- 
-@@ -1912,21 +2753,37 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
-             SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_FULL_RESTORE__\n");
-         }
- 
--        prompt = std::move(it_best->prompt);
-+        if (it_best->on_disk()) {
-+            SRV_WRN(" - restored a prompt state from disk (%d tokens, %zu checkpoints, %.3f MiB, %.2f ms)\n",
-+                    it_best->prompt.n_tokens(), it_best->prompt.checkpoints.size(),
-+                    it_best->size_disk / (1024.0 * 1024.0), (ggml_time_us() - t_start_us) / 1000.0);
- 
--        states.erase(it_best);
-+            prompt.tokens      = it_best->prompt.tokens.clone();
-+            prompt.checkpoints = std::move(it_best->prompt.checkpoints);
-+
-+            it_best->release();
-+
-+            // the file stays: a later prompt may branch from the same point, and a crash before
-+            // this slot is saved again must not lose it. Mark it most recently used.
-+            states.splice(states.end(), states, it_best);
-+        } else {
-+            prompt = std::move(it_best->prompt);
-+
-+            states.erase(it_best);
-+        }
-     }
- 
-     return true;
- }
- 
- void server_prompt_cache::update() {
--    if (limit_size > 0) {
--        while (!states.empty() && size() > limit_size) {
--            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
-+    // finish the writes the writer is done with
-+    for (auto it = states.begin(); it != states.end(); ) {
-+        it = it->job ? reap(it, false) : std::next(it);
-+    }
- 
--            states.pop_front();
--        }
-+    if (limit_size > 0) {
-+        evict("cache size limit reached", [&]() { return size() > limit_size; });
-     }
- 
-     // average size per token
-@@ -1936,19 +2793,19 @@ void server_prompt_cache::update() {
-     const size_t limit_tokens_cur = limit_size > 0 ? std::max<size_t>(limit_tokens, limit_size/size_per_token) : limit_tokens;
- 
-     if (limit_tokens > 0) {
--        while (!states.empty() && n_tokens() > limit_tokens_cur) {
--            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
--                    limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
-+        const std::string reason = string_format("cache token limit (%zu, est: %zu) reached", limit_tokens, limit_tokens_cur);
- 
--            states.pop_front();
--        }
-+        evict(reason.c_str(), [&]() { return n_tokens() > limit_tokens_cur; });
-     }
- 
--    SRV_TRC(" - cache state: %zu prompts, %.3f MiB (limits: %.3f MiB, %zu tokens, %zu est)\n",
--            states.size(), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
-+    SRV_TRC(" - cache state: %zu prompts, %.3f MiB (limits: %.3f MiB, %zu tokens, %zu est), %.3f MiB on disk\n",
-+            states.size(), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur,
-+            size_disk() / (1024.0 * 1024.0));
- 
-     for (const auto & state : states) {
--        SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
--                (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0));
-+        SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB%s\n",
-+                (const void *)&state, state.prompt.n_tokens(),
-+                state.on_disk() ? state.checkpoints_disk.size() : state.prompt.checkpoints.size(),
-+                (state.on_disk() ? state.size_disk : state.size()) / (1024.0 * 1024.0), state.on_disk() ? " (disk)" : "");
-     }
- }
-diff --git a/tools/server/server-task.h b/tools/server/server-task.h
-index 8faae1f18..1965af381 100644
---- a/tools/server/server-task.h
-+++ b/tools/server/server-task.h
-@@ -7,6 +7,12 @@
- #include <unordered_set>
- #include <list>
- #include <map>
++#include <condition_variable>
++#include <deque>
++#include <list>
 +#include <memory>
 +#include <mutex>
++#include <string>
 +#include <thread>
-+#include <deque>
-+#include <condition_variable>
-+#include <functional>
- 
- // TODO: prevent including the whole server-common.h as we only use server_tokens
- #include "server-common.h"
-@@ -715,10 +721,48 @@ struct server_prompt_data {
-     }
- };
- 
-+// position range of a checkpoint held in a state file, kept resident so the file does not
-+// have to be read to tell whether a checkpoint would make a spilled state reusable
-+struct server_prompt_checkpoint_pos {
-+    int64_t   n_tokens;
-+    llama_pos pos_min;
-+    llama_pos pos_max;
-+};
++#include <vector>
 +
-+// a state file being written by the cache's writer thread
++// disk tier of the prompt cache: the states evicted from RAM are written to a directory instead of
++// being dropped, and the whole cache is written there on shutdown, so it survives a restart
++
++// a state file being written by the writer thread
 +struct server_prompt_spill_job;
 +
- struct server_prompt_cache_state {
-     server_prompt prompt;
-     server_prompt_data data;
- 
-+    // the state's pos_min as it is after a restore, which decides whether it is reusable without a checkpoint
++struct server_prompt_disk_entry {
++    // the tokens, the lora config and the checkpoints without their data, enough for server_prompt::get_reuse()
++    server_prompt prompt;
++
++    // the state's pos_min as it was saved
 +    llama_pos pos_min = -1;
 +
-+    // when non-empty, the state data lives in this file instead of in `data`.
-+    // the token list stays resident either way so prefix matching does not need the file.
 +    std::string path;
-+    size_t size_disk = 0;
++    size_t size = 0;
 +
-+    // the checkpoints stored in the file
-+    std::vector<server_prompt_checkpoint_pos> checkpoints_disk;
-+
-+    // set until the cache has seen the write of the file finish
++    // set until the write of the file is seen to finish
 +    std::shared_ptr<server_prompt_spill_job> job;
++};
 +
-+    bool on_disk() const {
-+        return !path.empty();
-+    }
++struct server_prompt_disk {
++    server_prompt_disk() = default;
++    server_prompt_disk(const server_prompt_disk &) = delete;
++    server_prompt_disk & operator=(const server_prompt_disk &) = delete;
 +
-+    // a state on disk holds its data in memory only while it is being restored
-+    void release() {
-+        if (on_disk()) {
-+            data = {};
-+            prompt.checkpoints.clear();
-+        }
-+    }
++    ~server_prompt_disk();
 +
-+    // resident cost only: a spilled state has empty vectors and no checkpoints
-     size_t size() const {
-         size_t res = data.size();
- 
-@@ -736,6 +780,8 @@ struct server_prompt_cache {
-         this->limit_tokens = limit_tokens;
-     }
- 
-+    ~server_prompt_cache();
-+
-     std::list<server_prompt_cache_state> states;
- 
-     // in bytes, 0 = no limit
-@@ -744,8 +790,32 @@ struct server_prompt_cache {
-     // in tokens, 0 = no limit
-     size_t limit_tokens = 0;
- 
-+    // when set, states evicted for want of RAM are written here instead of being dropped
 +    std::string dir;
 +
 +    // in bytes, 0 = no limit
-+    size_t limit_size_disk = 0;
++    size_t limit_size = 0;
 +
-+    // identifies the model/context the spilled blobs belong to
++    // identifies the model/context the state files belong to
 +    uint64_t fingerprint = 0;
 +
 +    // whether the token lists may contain media chunks, needed to deserialize them
 +    bool has_mtmd = false;
 +
-+    // whether a state that diverges from the new prompt before its end can only be resumed
-+    // from a checkpoint (recurrent or SWA memory), and the SWA window when it applies
-+    bool    needs_checkpoint = false;
-+    int32_t n_swa            = 0;
++    // n_swa for server_prompt::get_reuse()
++    int32_t n_swa = 0;
 +
-+    // adopt the state files an earlier run left in `dir`, so the cache survives a restart.
-+    // files belonging to another model or context, and unreadable ones, are deleted.
-+    // returns how many entries were adopted.
-+    size_t index_dir(const llama_context * ctx);
++    // the server's lora adapters, a state file stores only their scales
++    std::vector<common_adapter_lora_info> lora_base;
 +
-     size_t size() const;
- 
-+    size_t size_disk() const;
++    // least recently used first
++    std::list<server_prompt_disk_entry> entries;
 +
-     size_t n_tokens() const;
- 
-     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
-@@ -753,6 +823,46 @@ struct server_prompt_cache {
-     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
- 
-     void update();
++    // adopt the state files an earlier run left in `dir`. files belonging to another model or
++    // context, and unreadable ones, are deleted. returns how many entries were adopted.
++    size_t index(const llama_context * ctx);
 +
-+    // write every resident state to `dir` and wait until all files are complete
++    // write a state evicted from RAM to a file, or drop it if it cannot be stored
++    void put(server_prompt_cache_state && state);
++
++    // when a state on disk keeps more of the new prompt than both the slot's own state and `pick`,
++    // read it into a new state at the end of `states` and return true
++    bool load(std::list<server_prompt_cache_state> & states, std::list<server_prompt_cache_state>::const_iterator pick,
++            const server_prompt * prompt, llama_pos pos_min, const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new);
++
++    // wait until all files are complete
 +    void flush();
 +
-+private:
-+    // hand a state's data to the writer thread. returns false if it cannot be written.
-+    bool spill(server_prompt_cache_state & state);
-+
-+    // read a spilled state's data and checkpoints back into it. returns false if the file is unusable.
-+    bool read_file(server_prompt_cache_state & state);
-+
-+    // drop `it`, deleting its file if it has one
-+    std::list<server_prompt_cache_state>::iterator drop(std::list<server_prompt_cache_state>::iterator it);
-+
-+    // finish the write of `it`'s file once the writer is done with it: drop the state if the write
-+    // failed, else drop the states on disk it replaces. returns the next state.
-+    std::list<server_prompt_cache_state>::iterator reap(std::list<server_prompt_cache_state>::iterator it, bool wait);
-+
-+    // move resident states to disk, or drop them, oldest first, while `over` holds
-+    void evict(const char * reason, const std::function<bool()> & over);
-+
-+    // evict spilled states, least recently used first, until the disk budget fits `need` more bytes
-+    void make_room_disk(size_t need);
++    size_t size() const;
 +
 +    // how many tokens of `tokens_new` a state could keep without being decoded again
-+    int n_reusable(const server_prompt_cache_state & state, const server_tokens & tokens_new) const;
++    int n_reusable(const server_prompt & prompt, llama_pos pos_min, const server_tokens & tokens_new) const;
 +
-+    // writer thread
++private:
++    // read the state data and the checkpoints of `entry` into `state`. returns false if the file is unusable.
++    bool read_file(const server_prompt_disk_entry & entry, server_prompt_cache_state & state);
++
++    // drop `it` and delete its file
++    std::list<server_prompt_disk_entry>::iterator drop(std::list<server_prompt_disk_entry>::iterator it);
++
++    // finish the write of `it`'s file once the writer is done with it: drop the entry if the write
++    // failed, else drop the entries it replaces. returns the next entry.
++    std::list<server_prompt_disk_entry>::iterator reap(std::list<server_prompt_disk_entry>::iterator it, bool wait);
++
++    // drop entries, least recently used first, until the disk budget fits `need` more bytes
++    void make_room(size_t need);
++
 +    void writer_loop();
 +    void writer_start();
 +    void writer_wait(const std::shared_ptr<server_prompt_spill_job> & job);
@@ -1550,6 +1177,155 @@ index 8faae1f18..1965af381 100644
 +    bool                                                 writer_stop = false;
 +
 +    size_t i_file = 0;
- };
++};
+diff --git a/tools/server/server-slot-sched.cpp b/tools/server/server-slot-sched.cpp
+index 9f9779348..4c8a31319 100644
+--- a/tools/server/server-slot-sched.cpp
++++ b/tools/server/server-slot-sched.cpp
+@@ -1,4 +1,5 @@
+ #include "server-slot-sched.h"
++#include "server-prompt-disk.h"
  
- // used exclusively by router mode
+ #include "common.h"
+ #include "llama.h"
+@@ -100,8 +101,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+ 
+     const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
+ 
+-    // skip over-limit entries to avoid disturbing the cache
+-    if (limit_size > 0 && state_size_new > limit_size) {
++    // skip over-limit entries to avoid disturbing the cache, unless update() can move them to disk
++    if (limit_size > 0 && state_size_new > limit_size && !disk) {
+         SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
+                 state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
+         return nullptr;
+@@ -126,6 +127,9 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
+                     states.front().size() / (1024.0 * 1024.0));
+ 
++            if (disk) {
++                disk->put(std::move(states.front()));
++            }
+             states.pop_front();
+         }
+     }
+@@ -177,6 +181,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+ 
+     auto it_best = states.end();
+ 
++    // with a disk tier, the states are ranked by the tokens they keep, see server_prompt_disk::n_reusable()
++    int n_best = 0;
++    if (disk && !is_empty) {
++        n_best = disk->n_reusable(prompt, llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), id_slot), tokens_new);
++    }
++
+     // find the most similar cached prompt, that would also preserve the most context
+     for (auto it = states.begin(); it != states.end(); ++it) {
+         if (lora_should_clear_cache(it->prompt.lora, lora_new)) {
+@@ -196,7 +206,16 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+             continue;
+         }
+ 
+-        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
++        bool is_better = f_keep_best < f_keep_cur && f_sim_best < f_sim_cur;
++
++        int n_cur = 0;
++        if (disk) {
++            n_cur     = disk->n_reusable(it->prompt, it->pos_min, tokens_new);
++            is_better = n_cur > n_best;
++        }
++
++        if (is_better) {
++            n_best      = n_cur;
+             f_keep_best = f_keep_cur;
+             f_sim_best  = f_sim_cur;
+             lcp_best    = lcp_cur;
+@@ -205,6 +224,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+         }
+     }
+ 
++    // a state on disk replaces the pick when it keeps more of the new prompt
++    if (disk && disk->load(states, it_best, is_empty ? nullptr : &prompt, llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), id_slot), tokens_new, lora_new)) {
++        it_best  = std::prev(states.end());
++        lcp_best = it_best->prompt.tokens.get_common_prefix(tokens_new);
++    }
++
+     if (it_best != states.end()) {
+         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+ 
+@@ -221,6 +246,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+                 return false;
+             }
+ 
++            // server_prompt_disk ranked the states by this
++            const llama_pos pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), id_slot);
++            if (pos_min != it_best->pos_min) {
++                SRV_WRN(" - restored state has pos_min = %d, expected %d\n", pos_min, it_best->pos_min);
++            }
++
+             data.clear();
+             data.shrink_to_fit();
+         }
+@@ -266,6 +297,9 @@ void server_prompt_cache::update() {
+         while (!states.empty() && size() > limit_size) {
+             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
+ 
++            if (disk) {
++                disk->put(std::move(states.front()));
++            }
+             states.pop_front();
+         }
+     }
+@@ -281,6 +315,9 @@ void server_prompt_cache::update() {
+             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
+                     limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
+ 
++            if (disk) {
++                disk->put(std::move(states.front()));
++            }
+             states.pop_front();
+         }
+     }
+diff --git a/tools/server/server-slot-sched.h b/tools/server/server-slot-sched.h
+index fc0099dc0..e50e5cb2b 100644
+--- a/tools/server/server-slot-sched.h
++++ b/tools/server/server-slot-sched.h
+@@ -46,8 +46,9 @@ struct server_prompt {
+     }
+ 
+     // n_prefix: tokens shared with the new prompt, must be > 0
+     // has_new_tokens: the new prompt is longer than n_prefix
++    // (mirrored by server_prompt_disk::n_reusable(), which passes these for a cached state as update_slots() does for the slot)
+     // n_swa: 0 if a state must end right before the next token (no SWA, or recurrent)
+     // pos_min: min position of the live state
+     // n_past == 0 without a checkpoint means that nothing can be reused
+     server_prompt_reuse get_reuse(int32_t n_prefix, bool has_new_tokens, int32_t n_swa, llama_pos pos_min) const;
+@@ -65,8 +66,11 @@ struct server_prompt_data {
+ struct server_prompt_cache_state {
+     server_prompt prompt;
+     server_prompt_data data;
+ 
++    // the pos_min of the state when it was saved
++    llama_pos pos_min = -1;
++
+     size_t size() const {
+         size_t res = data.size();
+ 
+         for (const auto & ckpt : prompt.checkpoints) {
+@@ -90,8 +94,16 @@ struct server_prompt_cache {
+ 
+     // in tokens, 0 = no limit
+     size_t limit_tokens = 0;
+ 
++    // when set, the states evicted from RAM go to disk, see server-prompt-disk.h
++    std::shared_ptr<struct server_prompt_disk> disk;
++
++    void init_disk(const common_params & params, int32_t n_ctx, const llama_context * ctx, bool has_draft, bool has_mtmd, int32_t n_swa);
++
++    // write all states to disk and wait until the files are complete
++    void flush_disk();
++
+     size_t size() const;
+ 
+     size_t n_tokens() const;
+ 
