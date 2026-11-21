@@ -6,7 +6,7 @@ Upstream [llama.cpp](https://github.com/ggml-org/llama.cpp)'s CUDA `server` imag
 
 - `0001`: `GGML_CUDA_MMVQ_MAX_NVFP4=<n>` sets the largest batch size that uses the MMVQ kernel for NVFP4.
 - `0002`: disk prompt cache, below.
-- `0003`: when the first checkpoint of a request falls on the context checkpoint it just restored, keeps that one instead of saving the same state again.
+- `0003`: when a request would save a context checkpoint it already holds (same tokens and positions, such as the one it just restored), keeps that one instead of saving the same state again.
 
 ## Disk prompt cache
 
@@ -15,3 +15,4 @@ States evicted from the RAM cache go to disk instead of being dropped, and the s
 - Enable it with `--cache-dir` and `--cache-disk` (see `--help`). It needs the RAM cache on.
 - Use a persistent folder per server. Files the server can't use are deleted.
 - A llama.cpp update, a model or context change, or a cache format change starts the disk cache empty.
+- On sliding-window (SWA) models, the disk cache may pick a slower state and log a `pos_min` warning.
