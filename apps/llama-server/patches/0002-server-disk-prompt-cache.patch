@@ -1,5 +1,5 @@
 diff --git a/common/arg.cpp b/common/arg.cpp
-index a63823767..6bc7c79bd 100644
+index c322b5c0f..6b6edca4e 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -1704,6 +1704,29 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
@@ -33,7 +33,7 @@ index a63823767..6bc7c79bd 100644
          {"-kvu", "--kv-unified"},
          {"-no-kvu", "--no-kv-unified"},
 diff --git a/common/common.h b/common/common.h
-index a8e89ed2d..181550771 100644
+index 22724e817..d7e86d5ec 100644
 --- a/common/common.h
 +++ b/common/common.h
 @@ -663,6 +663,8 @@ struct common_params {
@@ -59,7 +59,7 @@ index 9f9393f98..c2a86cdfa 100644
  
  if (BUILD_SHARED_LIBS)
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index bfade25d7..1bd01161e 100644
+index a9040260c..87699ae00 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -368,6 +368,8 @@ struct server_slot {
@@ -125,7 +125,16 @@ index bfade25d7..1bd01161e 100644
          } else {
              SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
          }
-@@ -5159,6 +5201,8 @@ bool server_context::load_model(common_params & params) {
+@@ -1819,7 +1861,7 @@ private:
+     std::vector<server_slot_info> get_slot_infos() const {
+         std::vector<server_slot_info> res;
+         for (const server_slot & slot : slots) {
+-            res.push_back({ slot.id, slot.task.get(), slot.is_processing(), slot.t_last_used, &slot.prompt });
++            res.push_back({ slot.id, slot.task.get(), slot.is_processing(), slot.t_last_used, &slot.prompt, llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id) });
+         }
+         return res;
+     }
+@@ -5173,6 +5215,8 @@ bool server_context::load_model(common_params & params) {
  void server_context::start_loop() {
      auto & params = impl->params_base;
      impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
@@ -136,10 +145,10 @@ index bfade25d7..1bd01161e 100644
  void server_context::terminate() {
 diff --git a/tools/server/server-prompt-disk.cpp b/tools/server/server-prompt-disk.cpp
 new file mode 100644
-index 000000000..03286781c
+index 000000000..7dcaa7e17
 --- /dev/null
 +++ b/tools/server/server-prompt-disk.cpp
-@@ -0,0 +1,925 @@
+@@ -0,0 +1,944 @@
 +#include "server-prompt-disk.h"
 +
 +#include "build-info.h"
@@ -408,6 +417,7 @@ index 000000000..03286781c
 +        std::to_string(params.kv_unified) + "|" +
 +        std::to_string(params.kv_unified_per_slot) + "|" +
 +        std::to_string(params.swa_full) + "|" +
++        std::to_string(llama_n_rs_seq(ctx)) + "|" +
 +        std::to_string((int) params.flash_attn_type) + "|" +
 +        std::to_string((int) params.cache_type_k) + "|" +
 +        std::to_string((int) params.cache_type_v) + "|" +
@@ -520,6 +530,15 @@ index 000000000..03286781c
 +
 +    // at least one token is evaluated [TAG_PROMPT_LOGITS]
 +    return std::min(n_past, (int) tokens_new.size() - 1);
++}
++
++int server_prompt_disk::n_reusable_live(const server_prompt & prompt, llama_pos pos_min, const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new) const {
++    // a prompt made with another lora config is cleared before the new one starts, see server_prompt_cache::find_better()
++    if (lora_should_clear_cache(prompt.lora, lora_new)) {
++        return 0;
++    }
++
++    return n_reusable(prompt, pos_min, tokens_new);
 +}
 +
 +void server_prompt_disk::writer_start() {
@@ -843,17 +862,17 @@ index 000000000..03286781c
 +    writer_cv.notify_one();
 +}
 +
-+bool server_prompt_disk::load(std::list<server_prompt_cache_state> & states, std::list<server_prompt_cache_state>::const_iterator pick,
-+        const server_prompt * prompt, llama_pos pos_min, const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new) {
-+    // the RAM candidate wins a tie, it does not have to be read back
-+    int n_best = prompt ? n_reusable(*prompt, pos_min, tokens_new) : 0;
-+    if (pick != states.end()) {
++std::list<server_prompt_disk_entry>::const_iterator server_prompt_disk::find(const server_prompt & prompt, llama_pos pos_min, const server_prompt_cache_state * pick,
++        const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new) const {
++    // the slot's state and the RAM candidate win a tie, they do not have to be read back
++    int n_best = n_reusable_live(prompt, pos_min, tokens_new, lora_new);
++    if (pick) {
 +        n_best = std::max(n_best, n_reusable(pick->prompt, pick->pos_min, tokens_new));
 +    }
 +
-+    auto it_best = entries.end();
++    auto it_best = entries.cend();
 +
-+    for (auto it = entries.begin(); it != entries.end(); ++it) {
++    for (auto it = entries.cbegin(); it != entries.cend(); ++it) {
 +        if (lora_should_clear_cache(it->prompt.lora, lora_new)) {
 +            continue;
 +        }
@@ -868,9 +887,18 @@ index 000000000..03286781c
 +        }
 +    }
 +
-+    if (it_best == entries.end()) {
++    return it_best;
++}
++
++bool server_prompt_disk::load(std::list<server_prompt_cache_state> & states, const server_prompt & prompt, llama_pos pos_min, const server_prompt_cache_state * pick,
++        const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new) {
++    const auto it_found = find(prompt, pos_min, pick, tokens_new, lora_new);
++    if (it_found == entries.cend()) {
 +        return false;
 +    }
++
++    // an empty erase gives a mutable iterator to the same entry
++    const auto it_best = entries.erase(it_found, it_found);
 +
 +    const int64_t t_start_us = ggml_time_us();
 +
@@ -1067,10 +1095,10 @@ index 000000000..03286781c
 +}
 diff --git a/tools/server/server-prompt-disk.h b/tools/server/server-prompt-disk.h
 new file mode 100644
-index 000000000..1d31eb6c9
+index 000000000..10c843810
 --- /dev/null
 +++ b/tools/server/server-prompt-disk.h
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,114 @@
 +#pragma once
 +
 +#include "server-slot-sched.h"
@@ -1138,10 +1166,14 @@ index 000000000..1d31eb6c9
 +    // write a state evicted from RAM to a file, or drop it if it cannot be stored
 +    void put(server_prompt_cache_state && state);
 +
-+    // when a state on disk keeps more of the new prompt than both the slot's own state and `pick`,
-+    // read it into a new state at the end of `states` and return true
-+    bool load(std::list<server_prompt_cache_state> & states, std::list<server_prompt_cache_state>::const_iterator pick,
-+            const server_prompt * prompt, llama_pos pos_min, const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new);
++    // the state on disk that keeps more of `tokens_new` than both the slot's own state `prompt` (its live
++    // pos_min) and `pick`, a state in RAM or nullptr. entries.end() if none
++    std::list<server_prompt_disk_entry>::const_iterator find(const server_prompt & prompt, llama_pos pos_min, const server_prompt_cache_state * pick,
++            const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new) const;
++
++    // read the result of find() into a new state at the end of `states` and return true
++    bool load(std::list<server_prompt_cache_state> & states, const server_prompt & prompt, llama_pos pos_min, const server_prompt_cache_state * pick,
++            const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new);
 +
 +    // wait until all files are complete
 +    void flush();
@@ -1150,6 +1182,9 @@ index 000000000..1d31eb6c9
 +
 +    // how many tokens of `tokens_new` a state could keep without being decoded again
 +    int n_reusable(const server_prompt & prompt, llama_pos pos_min, const server_tokens & tokens_new) const;
++
++    // the same for the slot's own state, 0 when the new prompt clears it
++    int n_reusable_live(const server_prompt & prompt, llama_pos pos_min, const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new) const;
 +
 +private:
 +    // read the state data and the checkpoints of `entry` into `state`. returns false if the file is unusable.
@@ -1179,7 +1214,7 @@ index 000000000..1d31eb6c9
 +    size_t i_file = 0;
 +};
 diff --git a/tools/server/server-slot-sched.cpp b/tools/server/server-slot-sched.cpp
-index 9f9779348..4c8a31319 100644
+index 526a144c3..d9e114408 100644
 --- a/tools/server/server-slot-sched.cpp
 +++ b/tools/server/server-slot-sched.cpp
 @@ -1,4 +1,5 @@
@@ -1209,20 +1244,28 @@ index 9f9779348..4c8a31319 100644
              states.pop_front();
          }
      }
-@@ -177,6 +181,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+@@ -164,8 +168,9 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+     return &states.back();
+ }
  
-     auto it_best = states.end();
+-std::list<server_prompt_cache_state>::const_iterator server_prompt_cache::find_better(const server_prompt & prompt, const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new, int & lcp) const {
++std::list<server_prompt_cache_state>::const_iterator server_prompt_cache::find_better(const server_prompt & prompt, llama_pos pos_min, const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new, int & lcp) const {
+     // a prompt made with another lora config is cleared before the new one starts, so it counts as empty
++    // (mirrored by server_prompt_disk::n_reusable_live())
+     const bool is_empty = prompt.tokens.empty() || lora_should_clear_cache(prompt.lora, lora_new);
+ 
+     lcp = is_empty ? 0 : prompt.tokens.get_common_prefix(tokens_new);
+@@ -177,6 +182,9 @@ std::list<server_prompt_cache_state>::const_iterator server_prompt_cache::find_b
+ 
+     auto it_best = states.cend();
  
 +    // with a disk tier, the states are ranked by the tokens they keep, see server_prompt_disk::n_reusable()
-+    int n_best = 0;
-+    if (disk && !is_empty) {
-+        n_best = disk->n_reusable(prompt, llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), id_slot), tokens_new);
-+    }
++    int n_best = disk ? disk->n_reusable_live(prompt, pos_min, tokens_new, lora_new) : 0;
 +
      // find the most similar cached prompt, that would also preserve the most context
-     for (auto it = states.begin(); it != states.end(); ++it) {
+     for (auto it = states.cbegin(); it != states.cend(); ++it) {
          if (lora_should_clear_cache(it->prompt.lora, lora_new)) {
-@@ -196,7 +206,16 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+@@ -196,7 +204,16 @@ std::list<server_prompt_cache_state>::const_iterator server_prompt_cache::find_b
              continue;
          }
  
@@ -1239,34 +1282,50 @@ index 9f9779348..4c8a31319 100644
 +            n_best      = n_cur;
              f_keep_best = f_keep_cur;
              f_sim_best  = f_sim_cur;
-             lcp_best    = lcp_cur;
-@@ -205,6 +224,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
-         }
-     }
+             lcp         = lcp_cur;
+@@ -212,16 +229,25 @@ std::list<server_prompt_cache_state>::const_iterator server_prompt_cache::find_b
+     return it_best;
+ }
  
-+    // a state on disk replaces the pick when it keeps more of the new prompt
-+    if (disk && disk->load(states, it_best, is_empty ? nullptr : &prompt, llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), id_slot), tokens_new, lora_new)) {
-+        it_best  = std::prev(states.end());
-+        lcp_best = it_best->prompt.tokens.get_common_prefix(tokens_new);
-+    }
+-bool server_prompt_cache::has_better(const server_prompt & prompt, const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new) const {
++bool server_prompt_cache::has_better(const server_prompt & prompt, llama_pos pos_min, const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new) const {
+     int lcp = 0;
+ 
+-    return find_better(prompt, tokens_new, lora_new, lcp) != states.cend();
++    return find_better(prompt, pos_min, tokens_new, lora_new, lcp) != states.cend() ||
++        (disk && disk->find(prompt, pos_min, nullptr, tokens_new, lora_new) != disk->entries.cend());
+ }
+ 
+ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+     int lcp_best = 0;
+ 
+-    const auto it_found = find_better(prompt, tokens_new, lora_new, lcp_best);
++    const llama_pos pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), id_slot);
 +
-     if (it_best != states.end()) {
-         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
++    auto it_found = find_better(prompt, pos_min, tokens_new, lora_new, lcp_best);
++
++    // a state on disk replaces the pick when it keeps more of the new prompt
++    if (disk && disk->load(states, prompt, pos_min, it_found == states.cend() ? nullptr : &*it_found, tokens_new, lora_new)) {
++        it_found = std::prev(states.cend());
++        lcp_best = it_found->prompt.tokens.get_common_prefix(tokens_new);
++    }
  
-@@ -221,6 +246,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+     // an empty erase gives a mutable iterator to the same entry, its prompt is moved out below
+     const auto it_best = states.erase(it_found, it_found);
+@@ -239,6 +265,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+ 
                  return false;
              }
- 
-+            // server_prompt_disk ranked the states by this
-+            const llama_pos pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), id_slot);
-+            if (pos_min != it_best->pos_min) {
-+                SRV_WRN(" - restored state has pos_min = %d, expected %d\n", pos_min, it_best->pos_min);
-+            }
 +
-             data.clear();
-             data.shrink_to_fit();
++            // server_prompt_disk ranked the states by this
++            const llama_pos pos_min_restored = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), id_slot);
++            if (pos_min_restored != it_best->pos_min) {
++                SRV_WRN(" - restored state has pos_min = %d, expected %d\n", pos_min_restored, it_best->pos_min);
++            }
          }
-@@ -266,6 +297,9 @@ void server_prompt_cache::update() {
+ 
+         {
+@@ -279,6 +311,9 @@ void server_prompt_cache::update() {
          while (!states.empty() && size() > limit_size) {
              SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
  
@@ -1276,7 +1335,7 @@ index 9f9779348..4c8a31319 100644
              states.pop_front();
          }
      }
-@@ -281,6 +315,9 @@ void server_prompt_cache::update() {
+@@ -294,6 +329,9 @@ void server_prompt_cache::update() {
              SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
                      limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
  
@@ -1286,8 +1345,17 @@ index 9f9779348..4c8a31319 100644
              states.pop_front();
          }
      }
+@@ -451,7 +489,7 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
+ 
+     // the checks above only tell if the outgoing state is worth saving
+     // the cache can still hold a better start for this task, so ask it
+-    update_cache = update_cache || prompt_cache->has_better(*ret->prompt, task.tokens, lora);
++    update_cache = update_cache || prompt_cache->has_better(*ret->prompt, ret->pos_min, task.tokens, lora);
+ 
+     return { ret->id, update_cache };
+ }
 diff --git a/tools/server/server-slot-sched.h b/tools/server/server-slot-sched.h
-index fc0099dc0..e50e5cb2b 100644
+index f1be0fe2f..187e3945f 100644
 --- a/tools/server/server-slot-sched.h
 +++ b/tools/server/server-slot-sched.h
 @@ -46,8 +46,9 @@ struct server_prompt {
@@ -1300,8 +1368,7 @@ index fc0099dc0..e50e5cb2b 100644
      // pos_min: min position of the live state
      // n_past == 0 without a checkpoint means that nothing can be reused
      server_prompt_reuse get_reuse(int32_t n_prefix, bool has_new_tokens, int32_t n_swa, llama_pos pos_min) const;
-@@ -65,8 +66,11 @@ struct server_prompt_data {
- struct server_prompt_cache_state {
+@@ -66,6 +67,9 @@ struct server_prompt_cache_state {
      server_prompt prompt;
      server_prompt_data data;
  
@@ -1311,9 +1378,7 @@ index fc0099dc0..e50e5cb2b 100644
      size_t size() const {
          size_t res = data.size();
  
-         for (const auto & ckpt : prompt.checkpoints) {
-@@ -90,8 +94,16 @@ struct server_prompt_cache {
- 
+@@ -91,6 +95,14 @@ struct server_prompt_cache {
      // in tokens, 0 = no limit
      size_t limit_tokens = 0;
  
@@ -1328,4 +1393,27 @@ index fc0099dc0..e50e5cb2b 100644
      size_t size() const;
  
      size_t n_tokens() const;
+@@ -99,10 +111,11 @@ struct server_prompt_cache {
  
+     // the cached state that is a better starting point than `prompt` for `tokens_new`, states.end() if none
+     // lcp: the common prefix of that state with `tokens_new`
++    // pos_min: min position of the live state of `prompt`
+     // lora_new: the lora config of the new prompt, the states made with another config are skipped
+-    std::list<server_prompt_cache_state>::const_iterator find_better(const server_prompt & prompt, const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new, int & lcp) const;
++    std::list<server_prompt_cache_state>::const_iterator find_better(const server_prompt & prompt, llama_pos pos_min, const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new, int & lcp) const;
+ 
+-    bool has_better(const server_prompt & prompt, const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new) const;
++    bool has_better(const server_prompt & prompt, llama_pos pos_min, const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new) const;
+ 
+     // restore the result of find_better into the slot `id_slot`
+     bool load(server_prompt & prompt, const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+@@ -119,6 +132,9 @@ struct server_slot_info {
+     int64_t t_last_used = -1;
+ 
+     const server_prompt * prompt = nullptr;
++
++    // min position of the slot's state, the prompt cache ranks the states by it
++    llama_pos pos_min = -1;
+ };
+ 
+ struct server_slot_plan {
