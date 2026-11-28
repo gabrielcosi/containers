@@ -5,7 +5,7 @@ variable "GIT_SHA" {}
 
 variable "VERSION" {
   // renovate: datasource=github-releases depName=jesdga95/basalt versioning=regex:^v(?<major>\d+)\.(?<minor>\d+)\.(?<patch>\d+)$
-  default = "v0.5.7"
+  default = "v0.6.0"
 }
 
 group "default" {
